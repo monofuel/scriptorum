@@ -62,24 +62,25 @@ spec (its own V2), it is done.
 ### V1 Agent Hierarchy
 
 ```
-Orchestrator (code — event loop + task queue)
-  ├── Architect (1x, large model — planning only)
-  └── Coding Agent (1x, small model — execution only)
+Orchestrator (code — HTTP MCP server, event loop, task queue, merge queue)
+  ├── Architect (1x, large model — spec → areas)
+  ├── Manager  (1x, medium model — area → tickets)
+  └── Coding Agent (1x, small model — ticket → code)
 ```
 
-The Manager from the rough plan is replaced by the orchestrator itself in V1. Ticket
-assignment, test runs, merges, and state transitions are deterministic code — no agent
-judgment needed. A Manager agent can be reintroduced in a later version if dynamic
-management decisions are required.
+All three agents communicate with the orchestrator over HTTP MCP. The orchestrator is the
+sole source of order and locking — no agent touches the plan branch or the filesystem
+directly.
 
 ### V1 Capabilities
 
 - `sanctum --init` sets up a new workspace with a planning branch and blank `spec.md`
-- `sanctum run` starts the orchestrator event loop
-- Orchestrator invokes Architect when there are no open tickets; Architect decomposes the spec and creates tickets via MCP tools
-- Orchestrator assigns the oldest open ticket to the Coding Agent and manages the worktree
-- Coding Agent works on the ticket and calls `report_done()` or `report_blocker()` when finished
-- Orchestrator runs tests, merges on pass, reopens on fail — all in code
+- `sanctum run` starts the orchestrator daemon: HTTP MCP server + event loop
+- Architect is invoked when areas are missing; it reads `spec.md` and creates area files
+- Manager is invoked per area when that area has no open tickets; it reads the area file and creates tickets
+- Orchestrator assigns the oldest open ticket to a Coding Agent and manages the worktree
+- Coding Agent works on the ticket and calls `submit_pr()` when finished
+- Merge queue: merge master into branch → `make test` → fast-forward merge to master on pass, reopen on fail
 - Master must stay green; if it breaks, all work halts until it is fixed
 
 ### V1 Out of Scope
@@ -91,10 +92,24 @@ management decisions are required.
 - Token budgets
 
 
+## Implementation
+
+Sanctum is written in **Nim**. Key libraries:
+
+- **MCPort** — MCP client/server over HTTP. Used for the orchestrator's MCP server and
+  for any agent harness that needs to act as an MCP client.
+- **jsony** — fast JSON parsing/serialization. Used for `sanctum.json` config and all
+  internal structured data.
+
+Tests are always run with **`make test`**. The project being managed by sanctum must have
+a `Makefile` with a `test` target. Sanctum does not support configurable test commands —
+`make test` is the contract.
+
+
 ## Agent Prompts
 
-System prompts for each agent role (`architect`, `coding_agent`, etc.) live in the
-sanctum source tree under `prompts/` and are embedded into the binary at compile time
+System prompts for each agent role (`architect`, `manager`, `coding_agent`, etc.) live in
+the sanctum source tree under `prompts/` and are embedded into the binary at compile time
 using Nim's `staticRead`. They are not stored in the plan branch and are not configurable
 at runtime — changing a prompt means cutting a new release of sanctum.
 
@@ -190,8 +205,9 @@ See spec.md §Requirements — parallel coding agents.
 - Statistics (Area 03)
 ```
 
-In V1, with no Manager agents, the orchestrator itself handles area decomposition and
-creates tickets directly from each area file. Manager agents are introduced later.
+The Manager agent is invoked by the orchestrator once per area when that area has no open
+or in-progress tickets. It reads the area file and creates tickets via the `create_ticket`
+MCP tool. The Architect owns areas; the Manager owns tickets within an area.
 
 ### Ticket Format
 
@@ -224,9 +240,9 @@ consequences in deterministic code.
 
 1. User runs `sanctum plan` → interactive conversation with Architect → Architect calls `submit_spec(content)` → orchestrator writes and commits `spec.md`
 2. Architect calls `create_area(...)` for each domain → orchestrator writes area files and commits
-3. Orchestrator (or Manager agent in later versions) reads each area and calls `create_ticket(...)` → orchestrator writes ticket files into `tickets/open/` and commits
+3. Manager is spawned per area → reads area file, calls `create_ticket(...)` via HTTP MCP → orchestrator writes ticket files into `tickets/open/` and commits
 4. Orchestrator picks the oldest open ticket, creates a code worktree, moves ticket to `in-progress/`
-5. Coding Agent works in its worktree; if stuck, calls `report_blocker(reason)` → orchestrator annotates the ticket and escalates
+5. Coding Agent works in its worktree; if stuck, calls `ask_manager(question)` → escalates up the chain as needed
 6. Coding Agent calls `submit_pr(summary)` → PR enters merge queue → orchestrator merges master into branch, runs tests → on pass: fast-forward merge to master, ticket moves to `done/` → on fail: ticket moves back to `open/` with failure notes
 7. Loop repeats until no open tickets remain
 
@@ -286,14 +302,16 @@ logs, and should be left running in a terminal or managed by a process superviso
 not exit on its own — kill it to stop it.
 
 Main loop:
-1. Orchestrator checks out `sanctum/plan` into a dedicated worktree (orchestrator only)
-2. If `spec.md` is empty or missing, log `WAITING: no spec — run 'sanctum plan'` and idle
-3. If no open tickets, decompose areas into tickets (orchestrator code reads area files and creates ticket files)
-4. Pick the oldest open ticket, create a code worktree, move ticket to `in-progress/`
-5. Spawn the Coding Agent harness subprocess, write ticket + area context + spec excerpt to its stdin
-6. Agent works; MCP tool calls enqueue tasks; orchestrator drains queue continuously
-7. On `submit_pr`: PR enters the merge queue → merge master into branch → run tests → fast-forward merge to master on pass, reopen ticket on fail
-8. Loop back to step 2
+1. Bind HTTP MCP server on a random localhost port (via MCPort)
+2. Check out `sanctum/plan` into a dedicated worktree (orchestrator only)
+3. If `spec.md` is empty or missing, log `WAITING: no spec — run 'sanctum plan'` and idle
+4. If `spec.md` exists but has no areas, spawn Architect — pass `spec.md` via stdin; Architect creates areas via HTTP MCP tools, then exits
+5. For each area with no open or in-progress tickets, spawn a Manager — pass area file + spec excerpt via stdin; Manager creates tickets via HTTP MCP tools, then exits
+6. Pick the oldest open ticket, create a code worktree, move ticket to `in-progress/`
+7. Spawn the Coding Agent harness — pass ticket + area context + spec excerpt via stdin; `SANCTUM_MCP_URL` and `SANCTUM_SESSION_TOKEN` via env
+8. Agent works; all tool calls arrive at the HTTP MCP server; orchestrator drains task queue continuously
+9. On `submit_pr`: PR enters merge queue → merge master into branch → `make test` → fast-forward merge to master on pass, reopen ticket on fail
+10. Loop back to step 4
 
 If an escalation reaches the Architect and the Architect cannot resolve it, the daemon logs
 `BLOCKED: waiting for user — run 'sanctum plan'` and idles until the block is cleared.
@@ -338,7 +356,7 @@ processes them one at a time, in order.
 |---|---|---|
 | `write_spec(content)` | `submit_spec` MCP call from Architect | Writes `spec.md`, commits to `sanctum/plan` |
 | `write_area(content)` | `create_area` MCP call from Architect | Writes area file under `areas/`, commits |
-| `create_ticket(spec)` | Orchestrator (from area decomposition) | Writes ticket file into `tickets/open/`, commits |
+| `create_ticket(spec)` | `create_ticket` MCP call from Manager | Writes ticket file into `tickets/open/`, commits |
 | `assign_ticket(id)` | Orchestrator (automatic) | Moves ticket to `in-progress/`, creates code worktree, commits |
 | `annotate_ticket(id, note)` | Any agent MCP call | Appends note to ticket file, commits |
 | `enqueue_pr(ticket_id, summary)` | `submit_pr` MCP call from Coding Agent | Adds the PR to the serial merge queue |
@@ -408,59 +426,75 @@ worktrees. It is the only writer. Agents receive ticket contents via stdin when 
 they never read the plan worktree directly.
 
 
-## Agent Communication (MCP / stdio)
+## Agent Communication (HTTP MCP)
 
-Agents communicate with the orchestrator exclusively through stdio-based MCP servers.
-No sockets, no HTTP, no shared memory. Each agent is spawned as a subprocess with a
-pipe to the orchestrator. Agents do not talk to each other.
+All agents — Architect, Manager, and Coding Agent — communicate with the orchestrator
+exclusively over HTTP MCP. The orchestrator runs a single HTTP MCP server on a random
+localhost port at startup. Every agent harness is given the server URL via the
+`SANCTUM_MCP_URL` and `SANCTUM_SESSION_TOKEN` environment variables when spawned.
+
+The MCP library used is **MCPort**, a Nim library for MCP client/server over HTTP.
+
+Centralising all communication through one HTTP MCP server means the orchestrator has
+a single chokepoint for ordering, locking, and logging — no agent can race another.
+Agents do not talk to each other or touch the filesystem outside their own worktree.
 
 ### Topology
 
 ```
-sanctum (orchestrator + task queue)
+Orchestrator (HTTP MCP server — MCPort)
+  │   localhost, random port, all agents connect here
   │
-  ├── plan worktree (sanctum/plan) — orchestrator only
+  ├── plan worktree  (sanctum/plan — orchestrator only)
   │
-  ├── spawns Architect (stdin/stdout pipe)
-  ├── spawns Coding Agent (stdin/stdout pipe)
-  └── code worktrees — one per active ticket
+  ├── Architect harness subprocess
+  │     context delivered via stdin; tools called over HTTP MCP
+  │
+  ├── Manager harness subprocess (one per area being decomposed)
+  │     context delivered via stdin; tools called over HTTP MCP
+  │
+  └── Coding Agent harness subprocess (one per active ticket)
+        context delivered via stdin; tools called over HTTP MCP
+        └── code worktree (scoped to this agent)
 ```
 
-The Manager role from the original design is absorbed into the orchestrator for V1.
-The logic for picking tickets, running tests, and merging is deterministic code, not
-an agent — a Manager agent adds little value over a simple loop when the rules are fixed.
-It can be reintroduced in a later version if dynamic management decisions are needed.
+### Session Tokens
+
+Each spawned subprocess receives a unique session token. The orchestrator uses this token
+to route incoming MCP tool calls to the correct agent context — which ticket, which area,
+which worktree. This is how multi-agent operation in V2 stays safe without any extra
+locking in the agents themselves.
 
 ### Agent MCP Tools
 
-Agents get a small set of simple, atomic tools. Each tool enqueues one task in the
-orchestrator and returns immediately. Agents do not wait for the consequence — they just
-report and continue or finish.
-
-**Architect tools:**
+**Architect:**
 
 | Tool | Arguments | Effect |
 |---|---|---|
-| `submit_spec(content)` | Markdown string | Enqueues `write_spec` — writes `spec.md` |
-| `create_area(title, summary, scope, out_of_scope)` | Structured fields | Enqueues `write_area` |
+| `submit_spec(content)` | Markdown string | Enqueues `write_spec` — writes `spec.md` and commits |
+| `create_area(title, summary, scope, out_of_scope)` | Structured fields | Enqueues `write_area` — writes area file and commits |
 | `add_note(ticket_id, note)` | Text | Enqueues `annotate_ticket` |
-| `answer_escalation(ticket_id, answer)` | Text | Resolves a blocked escalation; answer is passed back down the chain |
+| `answer_escalation(ticket_id, answer)` | Text | Resolves a blocked escalation; answer flows back to the waiting agent |
 
-**Coding Agent tools:**
+**Manager:**
 
 | Tool | Arguments | Effect |
 |---|---|---|
-| `run_tests()` | — | Runs the test suite in the worktree; returns exit code and output |
-| `submit_pr(summary)` | Text | Enqueues the PR in the orchestrator's merge queue. The merge queue will merge master into the branch, run tests, and merge to master if they pass — all automatically. The agent does not need to run tests first, though it may do so to catch failures early before entering the queue. |
-| `ask_manager(question)` | Text | Sends a question up to the Manager (orchestrator); blocks until an answer is returned |
+| `create_ticket(title, goal, acceptance_criteria, notes)` | Structured fields | Enqueues `create_ticket` — writes ticket file into `tickets/open/` and commits |
+| `add_note(ticket_id, note)` | Text | Enqueues `annotate_ticket` |
+| `ask_architect(question)` | Text | Escalates a question up to the Architect; blocks until answered |
+
+**Coding Agent:**
+
+| Tool | Arguments | Effect |
+|---|---|---|
+| `run_tests()` | — | Runs `make test` in the worktree; returns exit code and output |
+| `submit_pr(summary)` | Text | Enqueues the PR in the merge queue. Merge queue merges master into branch, runs `make test`, fast-forward merges to master on pass, reopens ticket on fail. Agent may call `run_tests()` first to fail fast before queuing. |
+| `ask_manager(question)` | Text | Escalates a question to the Manager; blocks until answered |
 | `add_note(note)` | Text | Enqueues `annotate_ticket` |
 
-Coding Agents also get standard file and shell tools scoped to their worktree (read, write,
-run commands). They cannot access the plan worktree or other code worktrees.
-
-The ticket is delivered to the Coding Agent via stdin when the harness subprocess is
-spawned. The agent reads its full assignment — ticket content, area context, and relevant
-spec excerpts — from stdin before doing any work.
+Coding Agents also receive standard file and shell tools from their harness, scoped to
+their worktree. They have no access to the plan worktree or other agents' worktrees.
 
 
 ## Models
