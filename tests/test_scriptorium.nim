@@ -1,7 +1,8 @@
 ## Tests for the scriptorium CLI and core utilities.
 
-import std/[os, osproc, sequtils, strutils, unittest]
-import scriptorium/[init, config, orchestrator]
+import
+  std/[os, osproc, sequtils, strutils, unittest],
+  scriptorium/[init, config, orchestrator]
 
 proc makeTestRepo(path: string) =
   ## Create a minimal git repository at path suitable for testing.
@@ -53,6 +54,16 @@ proc addTicketToPlan(repoPath: string, state: string, fileName: string, content:
     runCmdOrDie("git -C " & quoteShell(planPath) & " commit -m test-add-ticket")
   )
 
+proc moveTicketStateInPlan(repoPath: string, fromState: string, toState: string, fileName: string) =
+  ## Move a ticket file from one state directory to another and commit.
+  withPlanWorktree(repoPath, "move_ticket_state", proc(planPath: string) =
+    let fromPath = "tickets" / fromState / fileName
+    let toPath = "tickets" / toState / fileName
+    moveFile(planPath / fromPath, planPath / toPath)
+    runCmdOrDie("git -C " & quoteShell(planPath) & " add -A " & quoteShell("tickets"))
+    runCmdOrDie("git -C " & quoteShell(planPath) & " commit -m test-move-ticket")
+  )
+
 proc planCommitCount(repoPath: string): int =
   ## Return the commit count reachable from the plan branch.
   let (output, rc) = execCmdEx("git -C " & quoteShell(repoPath) & " rev-list --count scriptorium/plan")
@@ -64,6 +75,14 @@ proc planTreeFiles(repoPath: string): seq[string] =
   let (output, rc) = execCmdEx("git -C " & quoteShell(repoPath) & " ls-tree -r --name-only scriptorium/plan")
   doAssert rc == 0
   result = output.splitLines().filterIt(it.len > 0)
+
+proc gitWorktreePaths(repoPath: string): seq[string] =
+  ## Return absolute paths from git worktree list.
+  let (output, rc) = execCmdEx("git -C " & quoteShell(repoPath) & " worktree list --porcelain")
+  doAssert rc == 0
+  for line in output.splitLines():
+    if line.startsWith("worktree "):
+      result.add(line["worktree ".len..^1].strip())
 
 suite "scriptorium --init":
   test "creates scriptorium/plan branch":
@@ -358,3 +377,65 @@ suite "orchestrator manager ticket bootstrap":
     check callCount == 1
     check afterFirst == before + 1
     check afterSecond == afterFirst
+
+suite "orchestrator ticket assignment":
+  test "oldest open ticket picks the lowest numeric ID":
+    let tmp = getTempDir() / "scriptorium_test_oldest_open_ticket"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0002-second.md", "# Ticket 2\n\n**Area:** b\n")
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let oldest = oldestOpenTicket(tmp)
+    check oldest == "tickets/open/0001-first.md"
+
+  test "assign moves ticket to in-progress in one commit":
+    let tmp = getTempDir() / "scriptorium_test_assign_transition"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let before = planCommitCount(tmp)
+    let assignment = assignOldestOpenTicket(tmp)
+    let after = planCommitCount(tmp)
+    let files = planTreeFiles(tmp)
+
+    check assignment.openTicket == "tickets/open/0001-first.md"
+    check assignment.inProgressTicket == "tickets/in-progress/0001-first.md"
+    check "tickets/in-progress/0001-first.md" in files
+    check "tickets/open/0001-first.md" notin files
+    check after == before + 1
+
+  test "assign creates worktree and writes worktree metadata":
+    let tmp = getTempDir() / "scriptorium_test_assign_worktree"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let assignment = assignOldestOpenTicket(tmp)
+    check assignment.worktree.len > 0
+    check assignment.branch == "scriptorium/ticket-0001"
+    check assignment.worktree in gitWorktreePaths(tmp)
+
+    let (ticketContent, rc) = execCmdEx(
+      "git -C " & quoteShell(tmp) & " show scriptorium/plan:tickets/in-progress/0001-first.md"
+    )
+    check rc == 0
+    check ("**Worktree:** " & assignment.worktree) in ticketContent
+
+  test "cleanup removes stale ticket worktrees":
+    let tmp = getTempDir() / "scriptorium_test_cleanup_worktree"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let assignment = assignOldestOpenTicket(tmp)
+    moveTicketStateInPlan(tmp, "in-progress", "done", "0001-first.md")
+
+    let removed = cleanupStaleTicketWorktrees(tmp)
+    check assignment.worktree in removed
+    check assignment.worktree notin gitWorktreePaths(tmp)

@@ -13,6 +13,10 @@ const
   AreaCommitMessage = "scriptorium: update areas from spec"
   TicketCommitMessage = "scriptorium: create tickets from areas"
   AreaFieldPrefix = "**Area:**"
+  WorktreeFieldPrefix = "**Worktree:**"
+  TicketAssignCommitPrefix = "scriptorium: assign ticket"
+  ManagedWorktreeRoot = ".scriptorium/worktrees"
+  TicketBranchPrefix = "scriptorium/ticket-"
   DefaultLocalEndpoint* = "http://127.0.0.1:8097"
   IdleSleepMs = 200
   OrchestratorServerName = "scriptorium-orchestrator"
@@ -34,6 +38,12 @@ type
     content*: string
 
   ManagerTicketGenerator* = proc(model: string, areaPath: string, areaContent: string): seq[TicketDocument]
+
+  TicketAssignment* = object
+    openTicket*: string
+    inProgressTicket*: string
+    branch*: string
+    worktree*: string
 
   ServerThreadArgs = tuple[
     httpServer: HttpMcpServer,
@@ -120,6 +130,17 @@ proc areaIdFromAreaPath(areaRelPath: string): string =
   ## Derive the area identifier from an area file path.
   result = splitFile(areaRelPath).name
 
+proc ticketIdFromTicketPath(ticketRelPath: string): string =
+  ## Extract the numeric ticket identifier prefix from a ticket path.
+  let fileName = splitFile(ticketRelPath).name
+  let dashPos = fileName.find('-')
+  if dashPos < 1:
+    raise newException(ValueError, fmt"ticket filename has no numeric prefix: {fileName}")
+  let id = fileName[0..<dashPos]
+  if not id.allCharsInSet(Digits):
+    raise newException(ValueError, fmt"ticket filename has non-numeric prefix: {fileName}")
+  result = id
+
 proc parseAreaFromTicketContent(ticketContent: string): string =
   ## Extract the area identifier from a ticket markdown body.
   for line in ticketContent.splitLines():
@@ -127,6 +148,30 @@ proc parseAreaFromTicketContent(ticketContent: string): string =
     if trimmed.startsWith(AreaFieldPrefix):
       result = trimmed[AreaFieldPrefix.len..^1].strip()
       break
+
+proc parseWorktreeFromTicketContent(ticketContent: string): string =
+  ## Extract the worktree path from a ticket markdown body.
+  for line in ticketContent.splitLines():
+    let trimmed = line.strip()
+    if trimmed.startsWith(WorktreeFieldPrefix):
+      let value = trimmed[WorktreeFieldPrefix.len..^1].strip()
+      if value.len > 0 and value != "—" and value != "-":
+        result = value
+      break
+
+proc setTicketWorktree(ticketContent: string, worktreePath: string): string =
+  ## Set or append the ticket worktree metadata field.
+  var lines = ticketContent.strip().splitLines()
+  var updated = false
+  for i in 0..<lines.len:
+    if lines[i].strip().startsWith(WorktreeFieldPrefix):
+      lines[i] = WorktreeFieldPrefix & " " & worktreePath
+      updated = true
+      break
+  if not updated:
+    lines.add("")
+    lines.add(WorktreeFieldPrefix & " " & worktreePath)
+  result = lines.join("\n") & "\n"
 
 proc listMarkdownFiles(basePath: string): seq[string] =
   ## Collect markdown files recursively and return sorted absolute paths.
@@ -182,6 +227,59 @@ proc nextTicketId(planPath: string): int =
           let parsedId = parseInt(prefix)
           if parsedId >= result:
             result = parsedId + 1
+
+proc oldestOpenTicketInPlanPath(planPath: string): string =
+  ## Return the oldest open ticket path relative to planPath.
+  var bestId = high(int)
+  var bestRel = ""
+  for ticketPath in listMarkdownFiles(planPath / PlanTicketsOpenDir):
+    let rel = relativePath(ticketPath, planPath).replace('\\', '/')
+    let parsedId = parseInt(ticketIdFromTicketPath(rel))
+    if parsedId < bestId or (parsedId == bestId and rel < bestRel):
+      bestId = parsedId
+      bestRel = rel
+  result = bestRel
+
+proc branchNameForTicket(ticketRelPath: string): string =
+  ## Build a deterministic branch name for a ticket.
+  result = TicketBranchPrefix & ticketIdFromTicketPath(ticketRelPath)
+
+proc worktreePathForTicket(repoPath: string, ticketRelPath: string): string =
+  ## Build a deterministic absolute worktree path for a ticket.
+  let ticketName = splitFile(ticketRelPath).name
+  let root = repoPath / ManagedWorktreeRoot
+  result = absolutePath(root / ticketName)
+
+proc ensureWorktreeCreated(repoPath: string, ticketRelPath: string): tuple[branch: string, path: string] =
+  ## Ensure the code worktree exists for the ticket and return branch/path.
+  let branch = branchNameForTicket(ticketRelPath)
+  let path = worktreePathForTicket(repoPath, ticketRelPath)
+  createDir(parentDir(path))
+
+  discard gitCheck(repoPath, "worktree", "remove", "--force", path)
+  if dirExists(path):
+    removeDir(path)
+
+  if gitCheck(repoPath, "show-ref", "--verify", "--quiet", "refs/heads/" & branch) == 0:
+    gitRun(repoPath, "worktree", "add", path, branch)
+  else:
+    gitRun(repoPath, "worktree", "add", "-b", branch, path)
+
+  result = (branch: branch, path: path)
+
+proc listGitWorktreePaths(repoPath: string): seq[string] =
+  ## Return absolute worktree paths from git worktree list.
+  let allArgs = @["-C", repoPath, "worktree", "list", "--porcelain"]
+  let process = startProcess("git", args = allArgs, options = {poUsePath, poStdErrToStdOut})
+  let output = process.outputStream.readAll()
+  let rc = process.waitForExit()
+  process.close()
+  if rc != 0:
+    raise newException(IOError, fmt"git worktree list failed: {output.strip()}")
+
+  for line in output.splitLines():
+    if line.startsWith("worktree "):
+      result.add(line["worktree ".len..^1].strip())
 
 proc writeAreasAndCommit(planPath: string, docs: seq[AreaDocument]): bool =
   ## Write generated area files and commit only when contents changed.
@@ -288,6 +386,12 @@ proc areasNeedingTickets*(repoPath: string): seq[string] =
     areasNeedingTicketsInPlanPath(planPath)
   )
 
+proc oldestOpenTicket*(repoPath: string): string =
+  ## Return the oldest open ticket path in the plan branch.
+  result = withPlanWorktree(repoPath, proc(planPath: string): string =
+    oldestOpenTicketInPlanPath(planPath)
+  )
+
 proc syncAreasFromSpec*(repoPath: string, generateAreas: ArchitectAreaGenerator): bool =
   ## Generate and persist areas when plan/areas has no markdown files.
   if generateAreas.isNil:
@@ -330,6 +434,53 @@ proc syncTicketsFromAreas*(repoPath: string, generateTickets: ManagerTicketGener
           gitRun(planPath, "commit", "-m", TicketCommitMessage)
       hasChanges
   )
+
+proc assignOldestOpenTicket*(repoPath: string): TicketAssignment =
+  ## Move the oldest open ticket to in-progress and attach a code worktree.
+  result = withPlanWorktree(repoPath, proc(planPath: string): TicketAssignment =
+    let openTicket = oldestOpenTicketInPlanPath(planPath)
+    if openTicket.len == 0:
+      return TicketAssignment()
+
+    let inProgressTicket = PlanTicketsInProgressDir / splitFile(openTicket).name & ".md"
+    let openAbs = planPath / openTicket
+    let inProgressAbs = planPath / inProgressTicket
+    moveFile(openAbs, inProgressAbs)
+
+    let worktreeInfo = ensureWorktreeCreated(repoPath, inProgressTicket)
+    let content = readFile(inProgressAbs)
+    writeFile(inProgressAbs, setTicketWorktree(content, worktreeInfo.path))
+
+    gitRun(planPath, "add", "-A", PlanTicketsOpenDir, PlanTicketsInProgressDir)
+    if gitCheck(planPath, "diff", "--cached", "--quiet") != 0:
+      let ticketName = splitFile(inProgressTicket).name
+      gitRun(planPath, "commit", "-m", TicketAssignCommitPrefix & " " & ticketName)
+
+    result = TicketAssignment(
+      openTicket: openTicket,
+      inProgressTicket: inProgressTicket,
+      branch: worktreeInfo.branch,
+      worktree: worktreeInfo.path,
+    )
+  )
+
+proc cleanupStaleTicketWorktrees*(repoPath: string): seq[string] =
+  ## Remove managed code worktrees that no longer correspond to in-progress tickets.
+  let managedRoot = absolutePath(repoPath / ManagedWorktreeRoot)
+  let activeWorktrees = withPlanWorktree(repoPath, proc(planPath: string): HashSet[string] =
+    result = initHashSet[string]()
+    for ticketPath in listMarkdownFiles(planPath / PlanTicketsInProgressDir):
+      let worktreePath = parseWorktreeFromTicketContent(readFile(ticketPath))
+      if worktreePath.len > 0:
+        result.incl(worktreePath)
+  )
+
+  for path in listGitWorktreePaths(repoPath):
+    if path.startsWith(managedRoot) and not activeWorktrees.contains(path):
+      discard gitCheck(repoPath, "worktree", "remove", "--force", path)
+      if dirExists(path):
+        removeDir(path)
+      result.add(path)
 
 proc createOrchestratorServer*(): HttpMcpServer =
   ## Create the orchestrator MCP HTTP server.
