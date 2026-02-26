@@ -1,4 +1,5 @@
 import std/[os, strformat]
+import ./sanctum/[init]
 
 const
   Version = "0.1.0"
@@ -15,9 +16,7 @@ Usage:
 
 proc cmdInit(path: string) =
   ## Initialize a new sanctum workspace at the given path.
-  let target = if path.len > 0: path else: getCurrentDir()
-  echo fmt"sanctum: init not yet implemented (target: {target})"
-  quit(1)
+  runInit(path)
 
 proc cmdRun() =
   ## Start the orchestrator daemon.
