@@ -62,22 +62,24 @@ spec (its own V2), it is done.
 ### V1 Agent Hierarchy
 
 ```
-Architect (1x, smart model)
-  └── Manager (1x, mid-tier model)
-        └── Coding Agent (1x, cheaper model)
+Orchestrator (code — event loop + task queue)
+  ├── Architect (1x, large model — planning only)
+  └── Coding Agent (1x, small model — execution only)
 ```
 
-This is a static hierarchy — no dynamic spawning yet. One of each, wired together.
+The Manager from the rough plan is replaced by the orchestrator itself in V1. Ticket
+assignment, test runs, merges, and state transitions are deterministic code — no agent
+judgment needed. A Manager agent can be reintroduced in a later version if dynamic
+management decisions are required.
 
 ### V1 Capabilities
 
 - `sanctum --init` sets up a new workspace with a planning branch and base prompts
-- `sanctum run` starts the orchestrator: Architect reads the current spec and drives work
-- Architect decomposes a spec into tickets and writes them to the planning branch
-- Manager polls for open tickets, assigns one to the Coding Agent, tracks progress
-- Coding Agent works on the ticket in a git worktree and marks it done when finished
-- Manager runs tests after each ticket completes; if tests fail, the ticket is reopened
-- No merging agent yet — Manager handles the merge after tests pass
+- `sanctum run` starts the orchestrator event loop
+- Orchestrator invokes Architect when there are no open tickets; Architect decomposes the spec and creates tickets via MCP tools
+- Orchestrator assigns the oldest open ticket to the Coding Agent and manages the worktree
+- Coding Agent works on the ticket and calls `report_done()` or `report_blocker()` when finished
+- Orchestrator runs tests, merges on pass, reopens on fail — all in code
 - Master must stay green; if it breaks, all work halts until it is fixed
 
 ### V1 Out of Scope
@@ -89,6 +91,17 @@ This is a static hierarchy — no dynamic spawning yet. One of each, wired toget
 - Token budgets
 
 
+## Agent Prompts
+
+System prompts for each agent role (`architect`, `coding_agent`, etc.) live in the
+sanctum source tree under `prompts/` and are embedded into the binary at compile time
+using Nim's `staticRead`. They are not stored in the plan branch and are not configurable
+at runtime — changing a prompt means cutting a new release of sanctum.
+
+This keeps the plan branch purely about the current project's state. Prompts are code,
+not data.
+
+
 ## Planning Branch
 
 All planning artifacts live in a dedicated `sanctum/plan` git branch, separate from the
@@ -98,26 +111,87 @@ file, every state change is a git commit. Full audit trail for free.
 ### Branch Structure
 
 ```
-/spec/
-  overview.md          # The current master spec, written by the Architect
-  decisions/           # Architecture Decision Records (ADRs)
-    001-use-mcp.md
-    002-no-database.md
+spec.md                    # Top-level spec; built by Architect in conversation with user
+
+/areas/                    # Spec broken into focused domains; one per Manager assignment
+  01-cli.md
+  02-orchestrator.md
+  03-agent-system.md
 
 /tickets/
-  open/                # Ready to be worked on
+  open/                    # Ready to be worked on
     0001-scaffold-cli.md
-  in-progress/         # Currently assigned to an agent
+  in-progress/             # Currently assigned to a Coding Agent
     0002-architect-agent.md
-  done/                # Completed and merged
+  done/                    # Completed and merged
     0000-init-repo.md
 
-/prompts/              # Canonical system prompts for each role
-  architect.md
-  manager.md
-  coding_agent.md
-  merging_agent.md     # Stubbed in V1, used in V3
+/decisions/                # Architecture Decision Records (ADRs)
+  001-use-mcp.md
+  002-no-database.md
+  003-prompts-compiled-in.md
 ```
+
+`spec.md` is the single source of truth for the project's intent. Areas are derived from
+it and serve as the unit of work at the Manager level. Tickets are derived from areas and
+serve as the unit of work at the Coding Agent level.
+
+### spec.md
+
+The top-level spec is a plain markdown document that describes what the project is, what
+it must do, and what done looks like. It is written collaboratively — the user runs
+`sanctum plan` and has a conversation with the Architect, which produces or revises
+`spec.md`. The Architect owns this file; no other agent modifies it.
+
+A minimal spec.md:
+
+```markdown
+# the_sanctum — V2 Spec
+
+## Goal
+A self-upgrading agent orchestrator. Given this spec, a running V1 instance should
+be able to produce a working V2.
+
+## Requirements
+- Parallel coding agents (up to N, configured in sanctum.toml)
+- Statistics collection per ticket (model used, time taken, pass/fail)
+- Prediction of task difficulty based on ticket content
+
+## Out of Scope
+- UI
+- Remote execution
+
+## Done When
+- All requirements have passing tests
+- V1 can run against this spec and produce a V2 binary that passes its own test suite
+```
+
+### Area Files
+
+After `spec.md` is settled, the Architect decomposes it into area files. Each area is a
+focused slice of the spec that a Manager can own end-to-end. Areas contain enough context
+for a Manager to create tickets without referring back to the full spec constantly.
+
+```markdown
+# Area 02 — Orchestrator
+
+## Summary
+Extend the orchestrator to support parallel coding agents.
+
+## Context from spec
+See spec.md §Requirements — parallel coding agents.
+
+## Scope
+- Worker pool with configurable concurrency
+- Ticket locking (prevent two agents claiming the same ticket)
+- Graceful shutdown when all tickets are done
+
+## Out of Scope
+- Statistics (Area 03)
+```
+
+In V1, with no Manager agents, the orchestrator itself handles area decomposition and
+creates tickets directly from each area file. Manager agents are introduced later.
 
 ### Ticket Format
 
@@ -127,103 +201,179 @@ Each ticket is a markdown file. Moving the file between `open/`, `in-progress/`,
 ```markdown
 # 0001 — Scaffold the CLI
 
-**Status:** open
-**Assigned:** —
+**Area:** 01-cli
 **Worktree:** —
 
 ## Goal
 Create the `sanctum` binary with `--init` and `run` subcommands.
 
 ## Acceptance Criteria
-- [ ] `sanctum --init` creates a planning branch and base folder structure
+- [ ] `sanctum --init` creates the plan branch and folder structure
 - [ ] `sanctum run` starts a fully operational orchestrator loop
 - [ ] Tests pass
 
 ## Notes
-Keep it minimal. No config file needed yet.
+(appended by orchestrator as work progresses)
 ```
 
 ### Workflow
 
-1. Architect writes or updates `/spec/overview.md` and commits to `sanctum/plan`
-2. Architect decomposes the spec into ticket files under `/tickets/open/`
-3. Manager picks the next open ticket, moves it to `in-progress/`, sets assigned agent and worktree
-4. Coding Agent checks out the ticket, works in its git worktree, then marks the ticket done
-5. Manager runs tests; on pass, merges the worktree branch to master and moves ticket to `done/`
-6. Loop repeats until no open tickets remain
+Agents never commit to `sanctum/plan` directly. All plan branch mutations go through the
+orchestrator's task queue. Agents only call simple MCP tools; the orchestrator enacts the
+consequences in deterministic code.
 
-If a coding agent gets stuck or tests keep failing, the ticket gets a `## Blockers` section
-added and is escalated — moved back to `open/` with a note, and the Manager surfaces it to
-the Architect. The Architect can update the spec or the ticket and requeue it.
+1. User runs `sanctum plan` → interactive conversation with Architect → Architect calls `submit_spec(content)` → orchestrator writes and commits `spec.md`
+2. Architect calls `create_area(...)` for each domain → orchestrator writes area files and commits
+3. Orchestrator (or Manager agent in later versions) reads each area and calls `create_ticket(...)` → orchestrator writes ticket files into `tickets/open/` and commits
+4. Orchestrator picks the oldest open ticket, creates a code worktree, moves ticket to `in-progress/`
+5. Coding Agent works in its worktree; if stuck, calls `report_blocker(reason)` → orchestrator annotates the ticket and escalates
+6. Coding Agent calls `report_done()` → orchestrator enqueues: run tests → on pass: merge + move ticket to `done/` → on fail: annotate + move back to `open/`
+7. Loop repeats until no open tickets remain
+
+No agent decides when to run tests, when to merge, or when to move a ticket. Those are
+automatic consequences triggered by code, not by agent judgment.
 
 
 ## CLI — `sanctum`
 
 ```
-sanctum --init [path]   Initialize a new sanctum workspace
-sanctum run             Start the orchestrator (reads current spec, drives work)
-sanctum status          Show ticket counts and current agent activity
-sanctum plan            Open an interactive session with the Architect to update the spec
-sanctum worktrees       List active git worktrees and which tickets they belong to
+sanctum --init [path]      Initialize a new sanctum workspace
+sanctum --import [path]    Adopt an existing repo (later version)
+sanctum run                Start the orchestrator (reads current spec, drives work)
+sanctum status             Show ticket counts and current agent activity
+sanctum plan               Conversation with the Architect to build or revise spec.md
+sanctum worktrees          List active git worktrees and which tickets they belong to
 ```
 
 ### `sanctum --init`
 
 Sets up the workspace:
 1. Creates the `sanctum/plan` branch (orphan — no shared history with main)
-2. Writes the default folder structure (`spec/`, `tickets/open/`, `tickets/in-progress/`, `tickets/done/`, `prompts/`)
-3. Copies base system prompts into `/prompts/`
+2. Writes the folder structure (`areas/`, `tickets/open/`, `tickets/in-progress/`, `tickets/done/`, `decisions/`)
+3. Writes a blank `spec.md` placeholder
 4. Commits the skeleton to `sanctum/plan`
-5. Prints next steps: "Edit spec/overview.md, then run `sanctum run`"
+5. Prints next steps: "Run `sanctum plan` to build your spec with the Architect"
+
+No prompts are written — they are compiled into the binary.
+
+### `sanctum --import` *(later version)*
+
+Bootstraps sanctum onto an existing git repository that wasn't started with `sanctum --init`.
+The challenge: `spec.md` and the area files don't exist yet, but the codebase does.
+The Architect must reverse-engineer them from what's already there.
+
+Adoption process:
+1. Orchestrator creates the `sanctum/plan` branch and folder structure (same as `--init`)
+2. Orchestrator does a shallow crawl of the repo — file tree, README, existing docs, test
+   structure — and passes a summary to the Architect as context
+3. Architect reads the codebase and drafts `spec.md` describing what the project *is* and
+   what it *does*, as if writing the spec after the fact
+4. Architect decomposes the codebase into area files — one per logical domain found in the
+   existing code — documenting what each area covers and what its current state is
+5. User reviews via `sanctum plan` and iterates with the Architect until the spec and areas
+   accurately reflect the codebase
+6. From this point, `sanctum run` works normally — new tickets are written against a known
+   baseline rather than a blank slate
+
+The adopted spec is a description of reality, not a wishlist. Any gaps or problems the
+Architect identifies during adoption should be noted in the relevant area file so they can
+be ticketed and addressed later.
 
 ### `sanctum run`
 
-The main loop:
-1. Architect reads `spec/overview.md` and the current ticket state
-2. If there are no open tickets, Architect decomposes the spec into new tickets
-3. Manager picks the oldest open ticket and assigns it to the Coding Agent
-4. Coding Agent works in a fresh worktree (`git worktree add`)
-5. When the agent reports done, Manager runs tests
-6. On pass: merge, move ticket to `done/`, loop
-7. On fail: reopen ticket with failure notes, loop
+Starts the orchestrator event loop. The loop is pure code — agents don't drive it.
+
+1. Orchestrator checks out `sanctum/plan` into a dedicated worktree (read/write by orchestrator only)
+2. Orchestrator reads ticket state; if no open tickets, invokes Architect to decompose the spec
+3. Orchestrator picks the oldest open ticket, creates a code worktree, commits ticket to `in-progress/`
+4. Orchestrator invokes the Coding Agent with the ticket contents as context
+5. Agent works; any MCP tool calls (`report_done`, `report_blocker`, `add_note`) enqueue tasks in the orchestrator
+6. Orchestrator drains the task queue: runs tests, merges, updates ticket state, commits to plan — all in code
+7. Loop back to step 2
+
+
+## Orchestrator & Task Queue
+
+The orchestrator is a simple event loop with a serial task queue. It is the only process
+that writes to `sanctum/plan` or performs git operations. Agents never touch the plan
+branch — they only call MCP tools that enqueue tasks in the orchestrator.
+
+**The rule:** agents report facts; the orchestrator enacts consequences in code.
+
+### Task Queue Operations
+
+All mutations to the plan branch and worktrees go through the queue. The orchestrator
+processes them one at a time, in order.
+
+| Task | Triggered by | Effect |
+|---|---|---|
+| `write_spec(content)` | Architect MCP call | Writes `spec/overview.md`, commits to `sanctum/plan` |
+| `create_ticket(spec)` | Architect MCP call | Writes ticket file into `tickets/open/`, commits |
+| `assign_ticket(id)` | Orchestrator (automatic) | Moves ticket to `in-progress/`, creates code worktree, commits |
+| `annotate_ticket(id, note)` | Any agent MCP call | Appends note to ticket file, commits |
+| `run_tests(ticket_id)` | Orchestrator (automatic, after `report_done`) | Runs test suite in the worktree |
+| `merge_branch(ticket_id)` | Orchestrator (automatic, after tests pass) | Merges worktree branch to main |
+| `close_ticket(id)` | Orchestrator (automatic, after merge) | Moves ticket to `done/`, commits, cleans up worktree |
+| `reopen_ticket(id, reason)` | Orchestrator (automatic, after tests fail) | Moves ticket back to `open/`, appends failure notes, commits |
+| `escalate_ticket(id, reason)` | Orchestrator (automatic, after `report_blocker`) | Annotates ticket with blocker, surfaces to Architect |
+
+Chaining is done in code. When `run_tests` completes, the orchestrator enqueues either
+`merge_branch` or `reopen_ticket` based on the exit code — no agent decides this.
+
+### Plan Branch Worktree
+
+The orchestrator maintains a dedicated worktree for `sanctum/plan`, separate from all code
+worktrees. It is the only writer. Agents can read ticket contents (passed to them as
+context by the orchestrator) but cannot write to this worktree.
 
 
 ## Agent Communication (MCP / stdio)
 
-Agents communicate exclusively through stdio-based MCP servers. No sockets, no HTTP,
-no shared memory. Simple and local.
+Agents communicate with the orchestrator exclusively through stdio-based MCP servers.
+No sockets, no HTTP, no shared memory. Each agent is spawned as a subprocess with a
+pipe to the orchestrator. Agents do not talk to each other.
 
 ### Topology
 
 ```
-sanctum (orchestrator process)
+sanctum (orchestrator + task queue)
   │
-  ├── spawns Architect MCP server (stdin/stdout pipe)
-  ├── spawns Manager MCP server (stdin/stdout pipe)
-  └── spawns Coding Agent MCP server (stdin/stdout pipe)
+  ├── plan worktree (sanctum/plan) — orchestrator only
+  │
+  ├── spawns Architect (stdin/stdout pipe)
+  ├── spawns Coding Agent (stdin/stdout pipe)
+  └── code worktrees — one per active ticket
 ```
 
-The orchestrator is the message bus. Agents do not talk to each other directly — all
-messages route up or down through the hierarchy via the orchestrator.
+The Manager role from the original design is absorbed into the orchestrator for V1.
+The logic for picking tickets, running tests, and merging is deterministic code, not
+an agent — a Manager agent adds little value over a simple loop when the rules are fixed.
+It can be reintroduced in a later version if dynamic management decisions are needed.
 
-### Message Flow
+### Agent MCP Tools
 
-- **Downward:** Orchestrator pushes tasks and context to agents (e.g., "here is the ticket, here is the spec excerpt")
-- **Upward:** Agents push results, questions, or blockers back to the orchestrator
-- **Escalation:** If a Coding Agent raises a blocker, Manager decides whether to handle it
-  or escalate to Architect. Architect can revise the spec/ticket and requeue.
+Agents get a small set of simple, atomic tools. Each tool enqueues one task in the
+orchestrator and returns immediately. Agents do not wait for the consequence — they just
+report and continue or finish.
 
-### Agent Tool Surface
+**Architect tools:**
 
-Each agent gets a minimal MCP tool set appropriate to its role:
+| Tool | Arguments | Effect |
+|---|---|---|
+| `submit_spec(content)` | Markdown string | Enqueues `write_spec` |
+| `create_ticket(title, goal, acceptance_criteria, notes)` | Structured fields | Enqueues `create_ticket` |
+| `add_note(ticket_id, note)` | Text | Enqueues `annotate_ticket` |
 
-| Agent | Tools |
-|---|---|
-| Architect | read/write planning branch, create/update tickets, read spec |
-| Manager | read/write ticket status, spawn worktree, run tests, merge branch |
-| Coding Agent | read/write files in worktree, run tests, read assigned ticket |
+**Coding Agent tools:**
 
-Agents are otherwise sandboxed — a Coding Agent cannot touch the planning branch directly.
+| Tool | Arguments | Effect |
+|---|---|---|
+| `report_done()` | — | Enqueues `run_tests` → chains to merge or reopen |
+| `report_blocker(reason)` | Text | Enqueues `escalate_ticket` |
+| `add_note(ticket_id, note)` | Text | Enqueues `annotate_ticket` |
+
+Coding Agents also get standard file and shell tools scoped to their worktree (read, write,
+run commands). They cannot access the plan worktree or other code worktrees.
 
 
 ## Models
@@ -270,11 +420,36 @@ structured enough that a mid-tier model handles them well without burning budget
 Narrow, well-scoped execution tasks: implement the ticket, run tests, report done.
 These models run the most frequently, so cost per call matters.
 
-| Model | Provider | Notes |
+| Model | Provider | Harness | Notes |
+|---|---|---|---|
+| `grok-code-fast-1` | xAI API | `typoi` | Cheapest; best for high-volume or latency-sensitive work |
+| `codex-mini` | OpenAI API (GPT-5.1) | `codex` | Affordable; strong at code generation within tight scope |
+| `claude-haiku-4-5` | Anthropic API | `claude-code` | Pricier than the above two but well-integrated with Anthropic tooling |
+
+
+### Coding Agent Harnesses
+
+The Coding Agent is not invoked directly as an API call — it is spawned as a subprocess
+running a coding CLI tool. The orchestrator selects the harness based on the configured
+model.
+
+| Harness | Supported Models | Notes |
 |---|---|---|
-| `grok-code-fast-1` | xAI API | Cheapest; best for high-volume or latency-sensitive work |
-| `codex-mini` | OpenAI API (GPT-5.1) | Affordable; strong at code generation within tight scope |
-| `claude-haiku-4-5` | Anthropic API | Pricier than the above two but well-integrated with Anthropic tooling |
+| `claude-code` | All Anthropic models (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`) | Official Anthropic CLI |
+| `codex` | All OpenAI models (`codex-5.3`, `codex-mini`) and `qwen3.5-35b-a3b` | Requires a fully compliant Responses API endpoint with `previous_response_id` support — llama.cpp llama-server does not qualify |
+| `typoi` | Any model; **sole support for `grok-code-fast-1`** | Custom CLI agent harness; used when no other harness supports the model |
+
+Harness selection is automatic based on `sanctum.toml`:
+
+```toml
+[models]
+architect = "claude-opus-4-6"    # → claude-code
+manager   = "local/qwen3.5-35b-a3b"  # → codex (OpenAI-compatible endpoint)
+coding    = "grok-code-fast-1"   # → typoi
+```
+
+The orchestrator spawns the harness as a subprocess, passes the ticket contents and worktree
+path as context, and communicates via the harness's stdio MCP interface.
 
 
 ## Model Routing
