@@ -9,6 +9,9 @@ const
   PlanTicketsOpenDir = "tickets/open"
   PlanTicketsInProgressDir = "tickets/in-progress"
   PlanTicketsDoneDir = "tickets/done"
+  PlanMergeQueueDir = "queue/merge"
+  PlanMergeQueuePendingDir = "queue/merge/pending"
+  PlanMergeQueueActivePath = "queue/merge/active.md"
   PlanSpecPath = "spec.md"
   AreaCommitMessage = "scriptorium: update areas from spec"
   TicketCommitMessage = "scriptorium: create tickets from areas"
@@ -16,6 +19,10 @@ const
   WorktreeFieldPrefix = "**Worktree:**"
   TicketAssignCommitPrefix = "scriptorium: assign ticket"
   TicketAgentRunCommitPrefix = "scriptorium: record agent run"
+  MergeQueueInitCommitMessage = "scriptorium: initialize merge queue"
+  MergeQueueEnqueueCommitPrefix = "scriptorium: enqueue merge request"
+  MergeQueueDoneCommitPrefix = "scriptorium: complete ticket"
+  MergeQueueReopenCommitPrefix = "scriptorium: reopen ticket"
   ManagedWorktreeRoot = ".scriptorium/worktrees"
   TicketBranchPrefix = "scriptorium/ticket-"
   DefaultLocalEndpoint* = "http://127.0.0.1:8097"
@@ -23,6 +30,7 @@ const
   DefaultAgentMaxAttempts = 2
   AgentMessagePreviewChars = 1200
   AgentStdoutPreviewChars = 1200
+  MergeQueueOutputPreviewChars = 2000
   IdleSleepMs = 200
   OrchestratorServerName = "scriptorium-orchestrator"
   OrchestratorServerVersion = "0.1.0"
@@ -49,6 +57,14 @@ type
     inProgressTicket*: string
     branch*: string
     worktree*: string
+
+  MergeQueueItem* = object
+    pendingPath*: string
+    ticketPath*: string
+    ticketId*: string
+    branch*: string
+    worktree*: string
+    summary*: string
 
   ServerThreadArgs = tuple[
     httpServer: HttpMcpServer,
@@ -231,6 +247,178 @@ proc appendAgentRunNote(ticketContent: string, model: string, runResult: AgentRu
   let base = ticketContent.strip()
   let note = formatAgentRunNote(model, runResult).strip()
   result = base & "\n\n" & note & "\n"
+
+proc listMarkdownFiles(basePath: string): seq[string]
+
+proc runCommandCapture(workingDir: string, command: string, args: seq[string]): tuple[exitCode: int, output: string] =
+  ## Run a process and return combined stdout/stderr with its exit code.
+  let process = startProcess(
+    command,
+    workingDir = workingDir,
+    args = args,
+    options = {poUsePath, poStdErrToStdOut},
+  )
+  let output = process.outputStream.readAll()
+  let exitCode = process.waitForExit()
+  process.close()
+  result = (exitCode: exitCode, output: output)
+
+proc withMasterWorktree[T](repoPath: string, operation: proc(masterPath: string): T): T =
+  ## Open a temporary worktree for the master branch, run operation, then remove it.
+  if gitCheck(repoPath, "rev-parse", "--verify", "master") != 0:
+    raise newException(ValueError, "master branch does not exist")
+
+  let worktreeList = runCommandCapture(repoPath, "git", @["worktree", "list", "--porcelain"])
+  if worktreeList.exitCode != 0:
+    raise newException(IOError, fmt"git worktree list failed: {worktreeList.output.strip()}")
+
+  var currentPath = ""
+  for line in worktreeList.output.splitLines():
+    if line.startsWith("worktree "):
+      currentPath = line["worktree ".len..^1].strip()
+    elif line == "branch refs/heads/master" and currentPath.len > 0:
+      return operation(currentPath)
+
+  let masterWorktree = createTempDir("scriptorium_master_", "", getTempDir())
+  removeDir(masterWorktree)
+  gitRun(repoPath, "worktree", "add", masterWorktree, "master")
+  defer:
+    discard gitCheck(repoPath, "worktree", "remove", "--force", masterWorktree)
+
+  result = operation(masterWorktree)
+
+proc extractSubmitPrSummary*(text: string): string =
+  ## Extract submit_pr(summary) text from agent output when present.
+  let marker = "submit_pr("
+  let startIndex = text.find(marker)
+  if startIndex < 0:
+    return ""
+
+  let valueStart = startIndex + marker.len
+  let closeIndex = text.find(')', valueStart)
+  if closeIndex < 0:
+    return ""
+
+  var raw = text[valueStart..<closeIndex].strip()
+  if raw.startsWith("summary="):
+    raw = raw["summary=".len..^1].strip()
+  if raw.len >= 2 and ((raw[0] == '"' and raw[^1] == '"') or (raw[0] == '\'' and raw[^1] == '\'')):
+    raw = raw[1..^2]
+  result = raw.strip()
+
+proc queueFilePrefixNumber(fileName: string): int =
+  ## Parse the numeric prefix from a merge queue file name.
+  let base = splitFile(fileName).name
+  let dashPos = base.find('-')
+  if dashPos < 1:
+    return 0
+  let prefix = base[0..<dashPos]
+  if not prefix.allCharsInSet(Digits):
+    return 0
+  result = parseInt(prefix)
+
+proc nextMergeQueueId(planPath: string): int =
+  ## Compute the next monotonic merge queue identifier.
+  result = 1
+  for pendingPath in listMarkdownFiles(planPath / PlanMergeQueuePendingDir):
+    let parsed = queueFilePrefixNumber(extractFilename(pendingPath))
+    if parsed >= result:
+      result = parsed + 1
+
+proc ensureMergeQueueInitializedInPlanPath(planPath: string): bool =
+  ## Ensure merge queue directories and files exist in the plan worktree.
+  createDir(planPath / PlanMergeQueuePendingDir)
+  let keepPath = planPath / PlanMergeQueuePendingDir / ".gitkeep"
+  if not fileExists(keepPath):
+    writeFile(keepPath, "")
+    result = true
+
+  let activePath = planPath / PlanMergeQueueActivePath
+  if not fileExists(activePath):
+    writeFile(activePath, "")
+    result = true
+
+proc queueItemToMarkdown(item: MergeQueueItem): string =
+  ## Convert one merge queue item into markdown.
+  result =
+    "# Merge Queue Item\n\n" &
+    "**Ticket:** " & item.ticketPath & "\n" &
+    "**Ticket ID:** " & item.ticketId & "\n" &
+    "**Branch:** " & item.branch & "\n" &
+    "**Worktree:** " & item.worktree & "\n" &
+    "**Summary:** " & item.summary & "\n"
+
+proc parseQueueField(content: string, prefix: string): string =
+  ## Parse one single-line markdown field from queue item content.
+  for line in content.splitLines():
+    let trimmed = line.strip()
+    if trimmed.startsWith(prefix):
+      result = trimmed[prefix.len..^1].strip()
+      break
+
+proc parseMergeQueueItem(pendingPath: string, content: string): MergeQueueItem =
+  ## Parse one merge queue item from markdown.
+  result = MergeQueueItem(
+    pendingPath: pendingPath,
+    ticketPath: parseQueueField(content, "**Ticket:**"),
+    ticketId: parseQueueField(content, "**Ticket ID:**"),
+    branch: parseQueueField(content, "**Branch:**"),
+    worktree: parseQueueField(content, "**Worktree:**"),
+    summary: parseQueueField(content, "**Summary:**"),
+  )
+  if result.ticketPath.len == 0 or result.ticketId.len == 0 or result.branch.len == 0 or result.worktree.len == 0:
+    raise newException(ValueError, fmt"invalid merge queue item: {pendingPath}")
+
+proc listMergeQueueItems(planPath: string): seq[MergeQueueItem] =
+  ## Return merge queue items ordered by file name.
+  let pendingRoot = planPath / PlanMergeQueuePendingDir
+  if not dirExists(pendingRoot):
+    return @[]
+
+  var relPaths: seq[string] = @[]
+  for absPath in listMarkdownFiles(pendingRoot):
+    let fileName = extractFilename(absPath)
+    if fileName == ".gitkeep":
+      continue
+    relPaths.add(relativePath(absPath, planPath).replace('\\', '/'))
+  relPaths.sort()
+
+  for relPath in relPaths:
+    let content = readFile(planPath / relPath)
+    result.add(parseMergeQueueItem(relPath, content))
+
+proc formatMergeFailureNote(summary: string, mergeOutput: string, testOutput: string): string =
+  ## Format a ticket note for failed merge queue processing.
+  let mergePreview = truncateTail(mergeOutput.strip(), MergeQueueOutputPreviewChars)
+  let testPreview = truncateTail(testOutput.strip(), MergeQueueOutputPreviewChars)
+  result =
+    "## Merge Queue Failure\n" &
+    fmt"- Summary: {summary}\n"
+  if mergePreview.len > 0:
+    result &=
+      "\n### Merge Output\n" &
+      "```text\n" &
+      mergePreview & "\n" &
+      "```\n"
+  if testPreview.len > 0:
+    result &=
+      "\n### Test Output\n" &
+      "```text\n" &
+      testPreview & "\n" &
+      "```\n"
+
+proc formatMergeSuccessNote(summary: string, testOutput: string): string =
+  ## Format a ticket note for successful merge queue processing.
+  let testPreview = truncateTail(testOutput.strip(), MergeQueueOutputPreviewChars)
+  result =
+    "## Merge Queue Success\n" &
+    fmt"- Summary: {summary}\n"
+  if testPreview.len > 0:
+    result &=
+      "\n### Test Output\n" &
+      "```text\n" &
+      testPreview & "\n" &
+      "```\n"
 
 proc listMarkdownFiles(basePath: string): seq[string] =
   ## Collect markdown files recursively and return sorted absolute paths.
@@ -541,6 +729,116 @@ proc cleanupStaleTicketWorktrees*(repoPath: string): seq[string] =
         removeDir(path)
       result.add(path)
 
+proc ensureMergeQueueInitialized*(repoPath: string): bool =
+  ## Ensure the merge queue structure exists on the plan branch.
+  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+    let changed = ensureMergeQueueInitializedInPlanPath(planPath)
+    if changed:
+      gitRun(planPath, "add", PlanMergeQueueDir)
+      if gitCheck(planPath, "diff", "--cached", "--quiet") != 0:
+        gitRun(planPath, "commit", "-m", MergeQueueInitCommitMessage)
+    changed
+  )
+
+proc enqueueMergeRequest*(
+  repoPath: string,
+  assignment: TicketAssignment,
+  summary: string,
+): string =
+  ## Persist a merge request into the plan-branch merge queue.
+  if assignment.inProgressTicket.len == 0:
+    raise newException(ValueError, "in-progress ticket path is required")
+  if assignment.branch.len == 0:
+    raise newException(ValueError, "assignment branch is required")
+  if assignment.worktree.len == 0:
+    raise newException(ValueError, "assignment worktree is required")
+  if summary.strip().len == 0:
+    raise newException(ValueError, "merge summary is required")
+
+  result = withPlanWorktree(repoPath, proc(planPath: string): string =
+    discard ensureMergeQueueInitializedInPlanPath(planPath)
+
+    let queueId = nextMergeQueueId(planPath)
+    let ticketId = ticketIdFromTicketPath(assignment.inProgressTicket)
+    let pendingRelPath = PlanMergeQueuePendingDir / fmt"{queueId:04d}-{ticketId}.md"
+    let item = MergeQueueItem(
+      pendingPath: pendingRelPath,
+      ticketPath: assignment.inProgressTicket,
+      ticketId: ticketId,
+      branch: assignment.branch,
+      worktree: assignment.worktree,
+      summary: summary.strip(),
+    )
+
+    writeFile(planPath / pendingRelPath, queueItemToMarkdown(item))
+    gitRun(planPath, "add", PlanMergeQueueDir)
+    if gitCheck(planPath, "diff", "--cached", "--quiet") != 0:
+      gitRun(planPath, "commit", "-m", MergeQueueEnqueueCommitPrefix & " " & ticketId)
+    pendingRelPath
+  )
+
+proc processMergeQueue*(repoPath: string): bool =
+  ## Process at most one merge queue item and apply success/failure transitions.
+  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+    discard ensureMergeQueueInitializedInPlanPath(planPath)
+
+    let queueItems = listMergeQueueItems(planPath)
+    if queueItems.len == 0:
+      return false
+
+    let item = queueItems[0]
+    let activePath = planPath / PlanMergeQueueActivePath
+    writeFile(activePath, item.pendingPath & "\n")
+
+    let ticketPath = planPath / item.ticketPath
+    if not fileExists(ticketPath):
+      raise newException(ValueError, fmt"ticket does not exist in plan branch: {item.ticketPath}")
+
+    let mergeMasterResult = runCommandCapture(item.worktree, "git", @["merge", "--no-edit", "master"])
+    var testResult = (exitCode: 0, output: "")
+    if mergeMasterResult.exitCode == 0:
+      testResult = runCommandCapture(item.worktree, "make", @["test"])
+
+    let queuePath = planPath / item.pendingPath
+    var mergedToMaster = false
+    if mergeMasterResult.exitCode == 0 and testResult.exitCode == 0:
+      let mergeToMasterResult = withMasterWorktree(repoPath, proc(masterPath: string): tuple[exitCode: int, output: string] =
+        runCommandCapture(masterPath, "git", @["merge", "--ff-only", item.branch])
+      )
+      mergedToMaster = mergeToMasterResult.exitCode == 0
+      if not mergedToMaster:
+        testResult = mergeToMasterResult
+
+    if mergeMasterResult.exitCode == 0 and testResult.exitCode == 0 and mergedToMaster:
+      let doneRelPath = PlanTicketsDoneDir / extractFilename(item.ticketPath)
+      let successNote = formatMergeSuccessNote(item.summary, testResult.output).strip()
+      let updatedContent = readFile(ticketPath).strip() & "\n\n" & successNote & "\n"
+      writeFile(ticketPath, updatedContent)
+      moveFile(ticketPath, planPath / doneRelPath)
+      if fileExists(queuePath):
+        removeFile(queuePath)
+      writeFile(activePath, "")
+
+      gitRun(planPath, "add", "-A", PlanTicketsInProgressDir, PlanTicketsDoneDir, PlanMergeQueueDir)
+      if gitCheck(planPath, "diff", "--cached", "--quiet") != 0:
+        gitRun(planPath, "commit", "-m", MergeQueueDoneCommitPrefix & " " & item.ticketId)
+      true
+    else:
+      let openRelPath = PlanTicketsOpenDir / extractFilename(item.ticketPath)
+      let failureNote = formatMergeFailureNote(item.summary, mergeMasterResult.output, testResult.output).strip()
+      let updatedContent = readFile(ticketPath).strip() & "\n\n" & failureNote & "\n"
+      writeFile(ticketPath, updatedContent)
+      moveFile(ticketPath, planPath / openRelPath)
+      if fileExists(queuePath):
+        removeFile(queuePath)
+      writeFile(activePath, "")
+
+      gitRun(planPath, "add", "-A", PlanTicketsInProgressDir, PlanTicketsOpenDir, PlanMergeQueueDir)
+      if gitCheck(planPath, "diff", "--cached", "--quiet") != 0:
+        gitRun(planPath, "commit", "-m", MergeQueueReopenCommitPrefix & " " & item.ticketId)
+      true
+  )
+
 proc executeAssignedTicket*(
   repoPath: string,
   assignment: TicketAssignment,
@@ -589,6 +887,15 @@ proc executeAssignedTicket*(
       gitRun(planPath, "commit", "-m", TicketAgentRunCommitPrefix & " " & ticketName)
     0
   )
+
+  let submitSummaryFromMessage = extractSubmitPrSummary(agentResult.lastMessage)
+  let submitSummary =
+    if submitSummaryFromMessage.len > 0:
+      submitSummaryFromMessage
+    else:
+      extractSubmitPrSummary(agentResult.stdout)
+  if submitSummary.len > 0:
+    discard enqueueMergeRequest(repoPath, assignment, submitSummary)
 
 proc executeOldestOpenTicket*(repoPath: string, runner: AgentRunner = runAgent): AgentRunResult =
   ## Assign the oldest open ticket and execute it with the coding agent.
@@ -639,6 +946,7 @@ proc runOrchestratorLoop(repoPath: string, httpServer: HttpMcpServer, endpoint: 
     if maxTicks >= 0 and ticks >= maxTicks:
       break
     if hasPlanBranch(repoPath):
+      discard processMergeQueue(repoPath)
       discard executeOldestOpenTicket(repoPath)
     sleep(IdleSleepMs)
     inc ticks

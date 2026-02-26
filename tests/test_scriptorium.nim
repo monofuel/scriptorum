@@ -84,6 +84,18 @@ proc gitWorktreePaths(repoPath: string): seq[string] =
     if line.startsWith("worktree "):
       result.add(line["worktree ".len..^1].strip())
 
+proc addPassingMakefile(repoPath: string) =
+  ## Add a Makefile with a passing `make test` target and commit it on master.
+  writeFile(repoPath / "Makefile", "test:\n\t@echo PASS\n")
+  runCmdOrDie("git -C " & quoteShell(repoPath) & " add Makefile")
+  runCmdOrDie("git -C " & quoteShell(repoPath) & " commit -m test-add-passing-makefile")
+
+proc addFailingMakefile(repoPath: string) =
+  ## Add a Makefile with a failing `make test` target and commit it on master.
+  writeFile(repoPath / "Makefile", "test:\n\t@echo FAIL\n\t@false\n")
+  runCmdOrDie("git -C " & quoteShell(repoPath) & " add Makefile")
+  runCmdOrDie("git -C " & quoteShell(repoPath) & " commit -m test-add-failing-makefile")
+
 suite "scriptorium --init":
   test "creates scriptorium/plan branch":
     let tmp = getTempDir() / "scriptorium_test_init_branch"
@@ -494,3 +506,141 @@ suite "orchestrator coding agent execution":
     )
     check commitRc == 0
     check "scriptorium: record agent run 0001-first" in commitOutput
+
+  test "executeAssignedTicket enqueues merge request from submit_pr":
+    let tmp = getTempDir() / "scriptorium_test_execute_assigned_enqueue"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addPassingMakefile(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let assignment = assignOldestOpenTicket(tmp)
+    let before = planCommitCount(tmp)
+    proc fakeRunner(request: AgentRunRequest): AgentRunResult =
+      ## Return a deterministic run result that asks to submit a PR.
+      discard request
+      result = AgentRunResult(
+        backend: harnessCodex,
+        command: @["codex", "exec"],
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        stdout: "",
+        logFile: assignment.worktree / ".scriptorium/logs/0001/attempt-01.jsonl",
+        lastMessageFile: assignment.worktree / ".scriptorium/logs/0001/attempt-01.last_message.txt",
+        lastMessage: "Work complete.\nsubmit_pr(\"ship it\")",
+        timeoutKind: "none",
+      )
+
+    discard executeAssignedTicket(tmp, assignment, fakeRunner)
+    let after = planCommitCount(tmp)
+    let files = planTreeFiles(tmp)
+
+    check after == before + 2
+    check "queue/merge/pending/0001-0001.md" in files
+    let (queueEntry, queueRc) = execCmdEx(
+      "git -C " & quoteShell(tmp) & " show scriptorium/plan:queue/merge/pending/0001-0001.md"
+    )
+    check queueRc == 0
+    check "**Summary:** ship it" in queueEntry
+    check "**Branch:** scriptorium/ticket-0001" in queueEntry
+
+suite "orchestrator merge queue":
+  test "ensureMergeQueueInitialized is idempotent":
+    let tmp = getTempDir() / "scriptorium_test_merge_queue_init"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+
+    let before = planCommitCount(tmp)
+    let first = ensureMergeQueueInitialized(tmp)
+    let afterFirst = planCommitCount(tmp)
+    let second = ensureMergeQueueInitialized(tmp)
+    let afterSecond = planCommitCount(tmp)
+    let files = planTreeFiles(tmp)
+
+    check first
+    check not second
+    check afterFirst == before + 1
+    check afterSecond == afterFirst
+    check "queue/merge/pending/.gitkeep" in files
+    check "queue/merge/active.md" in files
+
+  test "processMergeQueue handles one item per call":
+    let tmp = getTempDir() / "scriptorium_test_merge_queue_single_flight"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addPassingMakefile(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+    addTicketToPlan(tmp, "open", "0002-second.md", "# Ticket 2\n\n**Area:** b\n")
+
+    let firstAssignment = assignOldestOpenTicket(tmp)
+    let secondAssignment = assignOldestOpenTicket(tmp)
+    discard enqueueMergeRequest(tmp, firstAssignment, "first summary")
+    discard enqueueMergeRequest(tmp, secondAssignment, "second summary")
+
+    let processed = processMergeQueue(tmp)
+    let files = planTreeFiles(tmp)
+    let queueFiles = files.filterIt(it.startsWith("queue/merge/pending/") and it.endsWith(".md"))
+
+    check processed
+    check "tickets/done/0001-first.md" in files
+    check "tickets/in-progress/0002-second.md" in files
+    check queueFiles.len == 1
+    check queueFiles[0] == "queue/merge/pending/0002-0002.md"
+
+  test "processMergeQueue success path merges to master and moves ticket to done":
+    let tmp = getTempDir() / "scriptorium_test_merge_queue_success"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addPassingMakefile(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let assignment = assignOldestOpenTicket(tmp)
+    writeFile(assignment.worktree / "ticket-output.txt", "done\n")
+    runCmdOrDie("git -C " & quoteShell(assignment.worktree) & " add ticket-output.txt")
+    runCmdOrDie("git -C " & quoteShell(assignment.worktree) & " commit -m ticket-output")
+    discard enqueueMergeRequest(tmp, assignment, "merge me")
+
+    let processed = processMergeQueue(tmp)
+    let files = planTreeFiles(tmp)
+    check processed
+    check "tickets/done/0001-first.md" in files
+    check "queue/merge/pending/0001-0001.md" notin files
+
+    let (masterFile, masterRc) = execCmdEx("git -C " & quoteShell(tmp) & " show master:ticket-output.txt")
+    check masterRc == 0
+    check masterFile.strip() == "done"
+
+    let (ticketContent, ticketRc) = execCmdEx(
+      "git -C " & quoteShell(tmp) & " show scriptorium/plan:tickets/done/0001-first.md"
+    )
+    check ticketRc == 0
+    check "## Merge Queue Success" in ticketContent
+
+  test "processMergeQueue failure path reopens ticket with failure note":
+    let tmp = getTempDir() / "scriptorium_test_merge_queue_failure"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addFailingMakefile(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    let assignment = assignOldestOpenTicket(tmp)
+    discard enqueueMergeRequest(tmp, assignment, "expected failure")
+    let processed = processMergeQueue(tmp)
+    let files = planTreeFiles(tmp)
+
+    check processed
+    check "tickets/open/0001-first.md" in files
+    check "tickets/in-progress/0001-first.md" notin files
+    check "queue/merge/pending/0001-0001.md" notin files
+
+    let (ticketContent, ticketRc) = execCmdEx(
+      "git -C " & quoteShell(tmp) & " show scriptorium/plan:tickets/open/0001-first.md"
+    )
+    check ticketRc == 0
+    check "## Merge Queue Failure" in ticketContent
