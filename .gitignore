@@ -2,10 +2,12 @@
 *
 !*/
 !*.*
+!Makefile
 
 # normal ignores:
 *.exe
 nimcache
+/sanctum
 *.pdb
 *.ilk
 *.out
