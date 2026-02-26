@@ -5,7 +5,7 @@ import
   scriptorium/harness_codex
 
 const
-  DefaultIntegrationModel = "gpt-5.1-mini"
+  DefaultIntegrationModel = "gpt-5.1-codex-mini"
 
 proc integrationModel(): string =
   ## Return the configured integration model, or the default model.
@@ -36,7 +36,14 @@ suite "integration codex harness":
     )
 
     let runResult = runCodex(request)
-    check runResult.exitCode == 0
-    check runResult.lastMessage.strip().len > 0
+    doAssert runResult.exitCode == 0,
+      "codex exec failed with non-zero exit code.\n" &
+      "Model: " & integrationModel() & "\n" &
+      "Command: " & runResult.command.join(" ") & "\n" &
+      "Stdout:\n" & runResult.stdout
+    doAssert runResult.lastMessage.strip().len > 0,
+      "codex did not produce a last message.\n" &
+      "Last message file: " & runResult.lastMessageFile & "\n" &
+      "Stdout:\n" & runResult.stdout
     check fileExists(runResult.logFile)
     check fileExists(runResult.lastMessageFile)

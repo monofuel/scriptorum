@@ -39,7 +39,7 @@ printf 'done\n' > "$last_message"
       let request = AgentRunRequest(
         prompt: "Write code.",
         workingDir: worktreePath,
-        model: "gpt-5.1-mini",
+        model: "gpt-5.1-codex-mini",
         ticketId: "0001",
         codexBinary: codexPath,
         logRoot: tmpDir / "logs",

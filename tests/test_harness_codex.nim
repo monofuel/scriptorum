@@ -24,7 +24,7 @@ proc newBaseRequest(tmpDir: string, codexPath: string, ticketId: string): CodexR
   result = CodexRunRequest(
     prompt: "Implement the task.",
     workingDir: worktreePath,
-    model: "gpt-5.1-mini",
+    model: "gpt-5.1-codex-mini",
     ticketId: ticketId,
     codexBinary: codexPath,
     logRoot: tmpDir / "logs",
@@ -34,7 +34,7 @@ suite "harness codex":
   test "buildCodexExecArgs matches expected arg order":
     let request = CodexRunRequest(
       workingDir: "/tmp/worktree",
-      model: "gpt-5.1-mini",
+      model: "gpt-5.1-codex-mini",
       skipGitRepoCheck: true,
     )
 
@@ -47,7 +47,7 @@ suite "harness codex":
       "--cd",
       "/tmp/worktree",
       "--model",
-      "gpt-5.1-mini",
+      "gpt-5.1-codex-mini",
       "--dangerously-bypass-approvals-and-sandbox",
       "--skip-git-repo-check",
       "-",
@@ -81,7 +81,7 @@ printf 'final:%s\n' "$model" > "$last_message"
       check result.timeoutKind == codexTimeoutNone
       check fileExists(result.logFile)
       check result.stdout.contains("\"type\":\"message\"")
-      check result.lastMessage.contains("final:gpt-5.1-mini")
+      check result.lastMessage.contains("final:gpt-5.1-codex-mini")
       check result.command.len > 0
       check result.command[0] == codexPath
     )
