@@ -1,5 +1,5 @@
 import std/[os, strformat]
-import ./scriptorium/[init]
+import ./scriptorium/[init, orchestrator]
 
 const
   Version = "0.1.0"
@@ -20,8 +20,7 @@ proc cmdInit(path: string) =
 
 proc cmdRun() =
   ## Start the orchestrator daemon.
-  echo "scriptorium: run not yet implemented"
-  quit(1)
+  runOrchestrator(getCurrentDir())
 
 proc cmdStatus() =
   ## Show ticket counts and current agent activity.

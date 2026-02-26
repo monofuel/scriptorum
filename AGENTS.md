@@ -11,8 +11,8 @@
 
 ## Tests
 
-- Run `nimble test` to run all tests
-- Individual test files can be run individually `nim r tests/test_*.nim` 
+- Run `make test` to run all tests
+- Individual test files can be run with `nim r tests/test_scriptorium.nim`
 
 ## Nim
 

@@ -1,7 +1,7 @@
 ## Tests for the scriptorium CLI and core utilities.
 
 import std/[unittest, os, osproc, strutils]
-import scriptorium/[init, config]
+import scriptorium/[init, config, orchestrator]
 
 proc makeTestRepo(path: string) =
   ## Create a minimal git repository at path suitable for testing.
@@ -87,3 +87,23 @@ suite "config":
     check harness("gpt-4o") == harnessCodex
     check harness("grok-code-fast-1") == harnessTypoi
     check harness("local/qwen3.5-35b-a3b") == harnessTypoi
+
+suite "orchestrator endpoint":
+  test "empty endpoint falls back to default":
+    let endpoint = parseEndpoint("")
+    check endpoint.address == "127.0.0.1"
+    check endpoint.port == 8097
+
+  test "parses endpoint from config value":
+    let tmp = getTempDir() / "scriptorium_test_orchestrator_endpoint"
+    createDir(tmp)
+    defer: removeDir(tmp)
+    writeFile(tmp / "scriptorium.json", """{"endpoints":{"local":"http://localhost:1234/v1"}}""")
+
+    let endpoint = loadOrchestratorEndpoint(tmp)
+    check endpoint.address == "localhost"
+    check endpoint.port == 1234
+
+  test "rejects endpoint missing host":
+    expect ValueError:
+      discard parseEndpoint("http:///v1")
