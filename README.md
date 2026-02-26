@@ -1,4 +1,4 @@
-# the_sanctum
+# scriptorium
 
 - the "cathedral" of agent orchestration
 
@@ -26,7 +26,7 @@ have a top level tool, `sanctum` with commands like `sanctum --init` to create a
 - could have a dedicated planning branch separate from the rest of the project (eg: like how github pages are separate) that is the database
 - no real database, everything is just markdown files committed in the special planning branch and tracked in git.
 
-- agents can work entirely through stdio MCP servers. very simple, all runs local.
+- agents can work entirely through MCP servers. very simple, all runs local.
 - messages would only flow up/down through the heirarchy
   - coding agents could ask questions that filter up through the managers, answers filter back down
   - some problems might require the plans be adjusted (eg: maybe a library doesn't support a feature we thought it had and we have to change things up)
@@ -91,6 +91,14 @@ directly.
 - Statistics and logging (comes in V2)
 - Token budgets
 
+### V1 Operational Rules
+
+- `sanctum.json` is the only runtime config file in V1. `sanctum.toml` is not supported.
+- The orchestrator is the only writer to `sanctum/plan`.
+- Every ticket state transition is a single git commit authored by the orchestrator.
+- A ticket is always in exactly one state directory (`open/`, `in-progress/`, or `done/`).
+- There is no "partially moved ticket" state in V1.
+
 
 ## Implementation
 
@@ -122,6 +130,9 @@ not data.
 All planning artifacts live in a dedicated `sanctum/plan` git branch, separate from the
 main codebase (similar to how `gh-pages` works). No database. Everything is a markdown
 file, every state change is a git commit. Full audit trail for free.
+
+Plan state is commit-based: if the commit exists, the state change exists; if not, the
+previous commit state remains authoritative.
 
 ### Branch Structure
 
@@ -168,7 +179,7 @@ A self-upgrading agent orchestrator. Given this spec, a running V1 instance shou
 be able to produce a working V2.
 
 ## Requirements
-- Parallel coding agents (up to N, configured in sanctum.toml)
+- Parallel coding agents (up to N, configured in sanctum.json)
 - Statistics collection per ticket (model used, time taken, pass/fail)
 - Prediction of task difficulty based on ticket content
 
@@ -385,6 +396,11 @@ For each PR in the queue:
 In V1, all PRs are auto-approved. No human review, no agent review. If tests pass after
 merging master, the code lands. The merger agent introduced in V3 will insert a code
 review step between steps 2 and 3.
+
+V1 merge policy is intentionally strict:
+- One merge-queue attempt per submitted PR.
+- No automatic retry on merge conflict or failing tests.
+- On failure, the ticket is reopened with notes and must be resubmitted after fixes.
 
 ### Escalation Path
 
