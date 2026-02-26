@@ -11,7 +11,8 @@
 
 ## Tests
 
-- Run `make test` to run all tests
+- Run `make test` to run local unit tests (`tests/test_*.nim`)
+- Run `make integration-test` to run integration tests (`tests/integration_*.nim`) that may call real external services/tools (for example Codex)
 - Individual test files can be run with `nim r tests/test_scriptorium.nim`
 
 ## Nim
