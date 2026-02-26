@@ -4,8 +4,8 @@ import
 
 const
   ConfigFile = "scriptorium.json"
-  DefaultArchitectModel = "codex-mini"
-  DefaultCodingModel = "codex-mini"
+  DefaultArchitectModel = "codex-fake-unit-test-model"
+  DefaultCodingModel = "codex-fake-unit-test-model"
 
 type
   Harness* = enum

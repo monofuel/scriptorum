@@ -4,6 +4,13 @@ import
   std/[os, osproc, sequtils, strutils, unittest],
   scriptorium/[agent_runner, config, init, orchestrator]
 
+const
+  CliBinaryName = "scriptorium_test_cli"
+let
+  ProjectRoot = getCurrentDir()
+var
+  cliBinaryPath = ""
+
 proc makeTestRepo(path: string) =
   ## Create a minimal git repository at path suitable for testing.
   createDir(path)
@@ -16,6 +23,20 @@ proc runCmdOrDie(cmd: string) =
   ## Run a shell command and fail the test immediately if it exits non-zero.
   let (_, rc) = execCmdEx(cmd)
   doAssert rc == 0, cmd
+
+proc ensureCliBinary(): string =
+  ## Build and cache the scriptorium CLI binary for command-output tests.
+  if cliBinaryPath.len == 0:
+    cliBinaryPath = getTempDir() / CliBinaryName
+    runCmdOrDie(
+      "nim c -o:" & quoteShell(cliBinaryPath) & " " & quoteShell(ProjectRoot / "src/scriptorium.nim")
+    )
+  result = cliBinaryPath
+
+proc runCliInRepo(repoPath: string, args: string): tuple[output: string, exitCode: int] =
+  ## Run the compiled CLI in repoPath and return output and exit code.
+  let command = "cd " & quoteShell(repoPath) & " && " & quoteShell(ensureCliBinary()) & " " & args
+  result = execCmdEx(command)
 
 proc withPlanWorktree(repoPath: string, suffix: string, action: proc(planPath: string)) =
   ## Open scriptorium/plan in a temporary worktree for direct test mutations.
@@ -140,10 +161,10 @@ suite "scriptorium --init":
       runInit(tmp)
 
 suite "config":
-  test "defaults to codex-mini for both roles":
+  test "defaults to fake unit-test codex model for both roles":
     let cfg = defaultConfig()
-    check cfg.models.architect == "codex-mini"
-    check cfg.models.coding == "codex-mini"
+    check cfg.models.architect == "codex-fake-unit-test-model"
+    check cfg.models.coding == "codex-fake-unit-test-model"
 
   test "loads from scriptorium.json":
     let tmp = getTempDir() / "scriptorium_test_config"
@@ -162,13 +183,13 @@ suite "config":
     defer: removeDir(tmp)
 
     let cfg = loadConfig(tmp)
-    check cfg.models.architect == "codex-mini"
-    check cfg.models.coding == "codex-mini"
+    check cfg.models.architect == "codex-fake-unit-test-model"
+    check cfg.models.coding == "codex-fake-unit-test-model"
 
   test "harness routing":
     check harness("claude-opus-4-6") == harnessClaudeCode
     check harness("claude-haiku-4-5") == harnessClaudeCode
-    check harness("codex-mini") == harnessCodex
+    check harness("codex-fake-unit-test-model") == harnessCodex
     check harness("gpt-4o") == harnessCodex
     check harness("grok-code-fast-1") == harnessTypoi
     check harness("local/qwen3.5-35b-a3b") == harnessTypoi
@@ -192,6 +213,100 @@ suite "orchestrator endpoint":
   test "rejects endpoint missing host":
     expect ValueError:
       discard parseEndpoint("http:///v1")
+
+suite "scriptorium CLI":
+  test "status command prints ticket counts and active agent snapshot":
+    let tmp = getTempDir() / "scriptorium_test_cli_status"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+    addTicketToPlan(
+      tmp,
+      "in-progress",
+      "0002-second.md",
+      "# Ticket 2\n\n**Area:** b\n\n**Worktree:** /tmp/worktree-0002\n",
+    )
+
+    let (output, rc) = runCliInRepo(tmp, "status")
+    let expected =
+      "Open: 1\n" &
+      "In Progress: 1\n" &
+      "Done: 0\n" &
+      "Active Agent Ticket: 0002 (tickets/in-progress/0002-second.md)\n" &
+      "Active Agent Branch: scriptorium/ticket-0002\n" &
+      "Active Agent Worktree: /tmp/worktree-0002\n"
+
+    check rc == 0
+    check output == expected
+
+  test "worktrees command lists active ticket worktrees":
+    let tmp = getTempDir() / "scriptorium_test_cli_worktrees"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(
+      tmp,
+      "in-progress",
+      "0002-second.md",
+      "# Ticket 2\n\n**Area:** b\n\n**Worktree:** /tmp/worktree-0002\n",
+    )
+    addTicketToPlan(
+      tmp,
+      "in-progress",
+      "0001-first.md",
+      "# Ticket 1\n\n**Area:** a\n\n**Worktree:** /tmp/worktree-0001\n",
+    )
+
+    let (output, rc) = runCliInRepo(tmp, "worktrees")
+    let expected =
+      "WORKTREE\tTICKET\tBRANCH\n" &
+      "/tmp/worktree-0001\t0001\tscriptorium/ticket-0001\n" &
+      "/tmp/worktree-0002\t0002\tscriptorium/ticket-0002\n"
+
+    check rc == 0
+    check output == expected
+
+suite "orchestrator plan spec update":
+  test "updateSpecFromArchitect writes spec and commits with mocked updater":
+    let tmp = getTempDir() / "scriptorium_test_plan_update_spec"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+
+    var callCount = 0
+    var capturedFirstModel = ""
+    var capturedFirstSpec = ""
+    var capturedFirstPrompt = ""
+    proc updater(model: string, currentSpec: string, prompt: string): string =
+      ## Return a deterministic updated spec document for plan command tests.
+      inc callCount
+      if callCount == 1:
+        capturedFirstModel = model
+        capturedFirstSpec = currentSpec
+        capturedFirstPrompt = prompt
+      result = "# Revised Spec\n\n- item\n"
+
+    let before = planCommitCount(tmp)
+    let changed = updateSpecFromArchitect(tmp, "expand scope", updater)
+    let after = planCommitCount(tmp)
+    let unchanged = updateSpecFromArchitect(tmp, "expand scope", updater)
+    let afterUnchanged = planCommitCount(tmp)
+    let (specBody, specRc) = execCmdEx("git -C " & quoteShell(tmp) & " show scriptorium/plan:spec.md")
+    let (logOutput, logRc) = execCmdEx("git -C " & quoteShell(tmp) & " log --oneline -1 scriptorium/plan")
+
+    check changed
+    check not unchanged
+    check callCount == 2
+    check capturedFirstModel == "codex-fake-unit-test-model"
+    check "Run `scriptorium plan`" in capturedFirstSpec
+    check capturedFirstPrompt == "expand scope"
+    check after == before + 1
+    check afterUnchanged == after
+    check specRc == 0
+    check specBody == "# Revised Spec\n\n- item\n"
+    check logRc == 0
+    check "scriptorium: update spec from architect" in logOutput
 
 suite "orchestrator planning bootstrap":
   test "loads spec from plan branch":
@@ -486,7 +601,7 @@ suite "orchestrator coding agent execution":
     let after = planCommitCount(tmp)
 
     check callCount == 1
-    check capturedRequest.model == "codex-mini"
+    check capturedRequest.model == "codex-fake-unit-test-model"
     check capturedRequest.workingDir == assignment.worktree
     check capturedRequest.ticketId == "0001"
     check "Ticket 1" in capturedRequest.prompt
@@ -498,7 +613,7 @@ suite "orchestrator coding agent execution":
     )
     check ticketRc == 0
     check "## Agent Run" in ticketContent
-    check "- Model: codex-mini" in ticketContent
+    check "- Model: codex-fake-unit-test-model" in ticketContent
     check "- Exit Code: 0" in ticketContent
 
     let (commitOutput, commitRc) = execCmdEx(

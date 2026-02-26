@@ -24,6 +24,7 @@ const
   MergeQueueDoneCommitPrefix = "scriptorium: complete ticket"
   MergeQueueReopenCommitPrefix = "scriptorium: reopen ticket"
   MergeQueueCleanupCommitPrefix = "scriptorium: cleanup merge queue"
+  PlanSpecCommitMessage = "scriptorium: update spec from architect"
   ManagedWorktreeRoot = ".scriptorium/worktrees"
   TicketBranchPrefix = "scriptorium/ticket-"
   DefaultLocalEndpoint* = "http://127.0.0.1:8097"
@@ -53,12 +54,28 @@ type
     content*: string
 
   ManagerTicketGenerator* = proc(model: string, areaPath: string, areaContent: string): seq[TicketDocument]
+  ArchitectSpecUpdater* = proc(model: string, currentSpec: string, prompt: string): string
 
   TicketAssignment* = object
     openTicket*: string
     inProgressTicket*: string
     branch*: string
     worktree*: string
+
+  ActiveTicketWorktree* = object
+    ticketPath*: string
+    ticketId*: string
+    branch*: string
+    worktree*: string
+
+  OrchestratorStatus* = object
+    openTickets*: int
+    inProgressTickets*: int
+    doneTickets*: int
+    activeTicketPath*: string
+    activeTicketId*: string
+    activeTicketBranch*: string
+    activeTicketWorktree*: string
 
   MergeQueueItem* = object
     pendingPath*: string
@@ -255,6 +272,53 @@ proc appendAgentRunNote(ticketContent: string, model: string, runResult: AgentRu
   let note = formatAgentRunNote(model, runResult).strip()
   result = base & "\n\n" & note & "\n"
 
+proc branchNameForTicket(ticketRelPath: string): string
+
+proc stripMarkdownCodeFence(value: string): string =
+  ## Remove a top-level markdown code fence wrapper when present.
+  let trimmed = value.strip()
+  if not trimmed.startsWith("```"):
+    return trimmed
+
+  let lines = trimmed.splitLines()
+  if lines.len < 3:
+    return trimmed
+  if lines[^1].strip() != "```":
+    return trimmed
+
+  result = lines[1..^2].join("\n").strip()
+
+proc buildArchitectPrompt(userPrompt: string, currentSpec: string): string =
+  ## Build the architect prompt used to revise spec.md.
+  result =
+    "You are the Architect for scriptorium.\n" &
+    "Update spec.md based on the user request.\n" &
+    "Return only the full updated markdown for spec.md.\n\n" &
+    "User request:\n" &
+    userPrompt.strip() & "\n\n" &
+    "Current spec.md:\n" &
+    currentSpec.strip() & "\n"
+
+proc runArchitectSpecUpdate(repoPath: string, model: string, currentSpec: string, prompt: string): string =
+  ## Run one architect model call and return the updated spec markdown text.
+  let runResult = runAgent(AgentRunRequest(
+    prompt: buildArchitectPrompt(prompt, currentSpec),
+    workingDir: repoPath,
+    model: model,
+    ticketId: "plan-spec",
+    attempt: 1,
+    skipGitRepoCheck: true,
+    maxAttempts: 1,
+  ))
+
+  var response = runResult.lastMessage.strip()
+  if response.len == 0:
+    response = runResult.stdout.strip()
+  response = stripMarkdownCodeFence(response)
+  if response.len == 0:
+    raise newException(ValueError, "architect returned empty spec content")
+  result = response
+
 proc listMarkdownFiles(basePath: string): seq[string]
 
 proc runCommandCapture(workingDir: string, command: string, args: seq[string]): tuple[exitCode: int, output: string] =
@@ -411,6 +475,19 @@ proc listMergeQueueItems(planPath: string): seq[MergeQueueItem] =
   for relPath in relPaths:
     let content = readFile(planPath / relPath)
     result.add(parseMergeQueueItem(relPath, content))
+
+proc listActiveTicketWorktreesInPlanPath(planPath: string): seq[ActiveTicketWorktree] =
+  ## Return active in-progress ticket worktrees from a plan worktree path.
+  for ticketPath in listMarkdownFiles(planPath / PlanTicketsInProgressDir):
+    let relPath = relativePath(ticketPath, planPath).replace('\\', '/')
+    let content = readFile(ticketPath)
+    result.add(ActiveTicketWorktree(
+      ticketPath: relPath,
+      ticketId: ticketIdFromTicketPath(relPath),
+      branch: branchNameForTicket(relPath),
+      worktree: parseWorktreeFromTicketContent(content),
+    ))
+  result.sort(proc(a: ActiveTicketWorktree, b: ActiveTicketWorktree): int = cmp(a.ticketPath, b.ticketPath))
 
 proc formatMergeFailureNote(summary: string, mergeOutput: string, testOutput: string): string =
   ## Format a ticket note for failed merge queue processing.
@@ -664,6 +741,43 @@ proc oldestOpenTicket*(repoPath: string): string =
     oldestOpenTicketInPlanPath(planPath)
   )
 
+proc listActiveTicketWorktrees*(repoPath: string): seq[ActiveTicketWorktree] =
+  ## Return active in-progress ticket worktrees from the plan branch.
+  result = withPlanWorktree(repoPath, proc(planPath: string): seq[ActiveTicketWorktree] =
+    listActiveTicketWorktreesInPlanPath(planPath)
+  )
+
+proc readOrchestratorStatus*(repoPath: string): OrchestratorStatus =
+  ## Return plan ticket counts and current active agent metadata.
+  result = withPlanWorktree(repoPath, proc(planPath: string): OrchestratorStatus =
+    result = OrchestratorStatus(
+      openTickets: listMarkdownFiles(planPath / PlanTicketsOpenDir).len,
+      inProgressTickets: listMarkdownFiles(planPath / PlanTicketsInProgressDir).len,
+      doneTickets: listMarkdownFiles(planPath / PlanTicketsDoneDir).len,
+    )
+
+    let activeQueuePath = planPath / PlanMergeQueueActivePath
+    if fileExists(activeQueuePath):
+      let activeRelPath = readFile(activeQueuePath).strip()
+      if activeRelPath.len > 0:
+        let pendingPath = planPath / activeRelPath
+        if fileExists(pendingPath):
+          let item = parseMergeQueueItem(activeRelPath, readFile(pendingPath))
+          result.activeTicketPath = item.ticketPath
+          result.activeTicketId = item.ticketId
+          result.activeTicketBranch = item.branch
+          result.activeTicketWorktree = item.worktree
+
+    if result.activeTicketId.len == 0:
+      let activeWorktrees = listActiveTicketWorktreesInPlanPath(planPath)
+      if activeWorktrees.len > 0:
+        let active = activeWorktrees[0]
+        result.activeTicketPath = active.ticketPath
+        result.activeTicketId = active.ticketId
+        result.activeTicketBranch = active.branch
+        result.activeTicketWorktree = active.worktree
+  )
+
 proc syncAreasFromSpec*(repoPath: string, generateAreas: ArchitectAreaGenerator): bool =
   ## Generate and persist areas when plan/areas has no markdown files.
   if generateAreas.isNil:
@@ -679,6 +793,45 @@ proc syncAreasFromSpec*(repoPath: string, generateAreas: ArchitectAreaGenerator)
       true
     else:
       false
+  )
+
+proc updateSpecFromArchitect*(
+  repoPath: string,
+  prompt: string,
+  updateSpec: ArchitectSpecUpdater,
+): bool =
+  ## Update spec.md from an architect updater and commit when content changes.
+  if updateSpec.isNil:
+    raise newException(ValueError, "architect spec updater is required")
+  if prompt.strip().len == 0:
+    raise newException(ValueError, "plan prompt is required")
+
+  let cfg = loadConfig(repoPath)
+  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+    let specPath = planPath / PlanSpecPath
+    let existingSpec = loadSpecFromPlanPath(planPath)
+    let updatedBody = updateSpec(cfg.models.architect, existingSpec, prompt).strip()
+    if updatedBody.len == 0:
+      raise newException(ValueError, "architect spec updater returned empty content")
+
+    let updatedSpec = updatedBody & "\n"
+    if updatedSpec == existingSpec:
+      false
+    else:
+      writeFile(specPath, updatedSpec)
+      gitRun(planPath, "add", PlanSpecPath)
+      if gitCheck(planPath, "diff", "--cached", "--quiet") != 0:
+        gitRun(planPath, "commit", "-m", PlanSpecCommitMessage)
+      true
+  )
+
+proc updateSpecFromArchitect*(repoPath: string, prompt: string): bool =
+  ## Update spec.md using the default architect model backend.
+  result = updateSpecFromArchitect(
+    repoPath,
+    prompt,
+    proc(model: string, currentSpec: string, userPrompt: string): string =
+      runArchitectSpecUpdate(repoPath, model, currentSpec, userPrompt),
   )
 
 proc syncTicketsFromAreas*(repoPath: string, generateTickets: ManagerTicketGenerator): bool =
