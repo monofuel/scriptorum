@@ -1,12 +1,7 @@
 import
-  std/[os, osproc, streams, strformat, strutils, tempfiles, uri]
-import
-  mcport
-import
+  std/[os, osproc, posix, streams, strformat, strutils, tempfiles, uri],
+  mcport,
   ./config
-
-when defined(posix):
-  import std/posix
 
 const
   PlanBranch = "scriptorium/plan"
@@ -29,13 +24,11 @@ type
 
   ArchitectAreaGenerator* = proc(model: string, spec: string): seq[AreaDocument]
 
-when compileOption("threads"):
-  type
-    ServerThreadArgs = tuple[
-      httpServer: HttpMcpServer,
-      address: string,
-      port: int,
-    ]
+  ServerThreadArgs = tuple[
+    httpServer: HttpMcpServer,
+    address: string,
+    port: int,
+  ]
 
 var shouldRun {.volatile.} = true
 
@@ -197,45 +190,39 @@ proc handleCtrlC() {.noconv.} =
   ## Stop the orchestrator loop on Ctrl+C.
   shouldRun = false
 
-when defined(posix):
-  proc handlePosixSignal(signalNumber: cint) {.noconv.} =
-    ## Stop the orchestrator loop on SIGINT/SIGTERM.
-    discard signalNumber
-    shouldRun = false
+proc handlePosixSignal(signalNumber: cint) {.noconv.} =
+  ## Stop the orchestrator loop on SIGINT/SIGTERM.
+  discard signalNumber
+  shouldRun = false
 
 proc installSignalHandlers() =
   ## Install signal handlers used by the orchestrator run loop.
   setControlCHook(handleCtrlC)
-  when defined(posix):
-    posix.signal(SIGINT, handlePosixSignal)
-    posix.signal(SIGTERM, handlePosixSignal)
+  posix.signal(SIGINT, handlePosixSignal)
+  posix.signal(SIGTERM, handlePosixSignal)
 
-when compileOption("threads"):
-  proc runHttpServer(args: ServerThreadArgs) {.thread.} =
-    ## Run the MCP HTTP server in a background thread.
-    args.httpServer.serve(args.port, args.address)
+proc runHttpServer(args: ServerThreadArgs) {.thread.} =
+  ## Run the MCP HTTP server in a background thread.
+  args.httpServer.serve(args.port, args.address)
 
 proc runOrchestratorLoop(httpServer: HttpMcpServer, endpoint: OrchestratorEndpoint, maxTicks: int) =
   ## Start HTTP transport and execute the orchestrator idle event loop.
   shouldRun = true
   installSignalHandlers()
 
-  when compileOption("threads"):
-    var serverThread: Thread[ServerThreadArgs]
-    createThread(serverThread, runHttpServer, (httpServer, endpoint.address, endpoint.port))
+  var serverThread: Thread[ServerThreadArgs]
+  createThread(serverThread, runHttpServer, (httpServer, endpoint.address, endpoint.port))
 
-    var ticks = 0
-    while shouldRun:
-      if maxTicks >= 0 and ticks >= maxTicks:
-        break
-      sleep(IdleSleepMs)
-      inc ticks
+  var ticks = 0
+  while shouldRun:
+    if maxTicks >= 0 and ticks >= maxTicks:
+      break
+    sleep(IdleSleepMs)
+    inc ticks
 
-    shouldRun = false
-    httpServer.close()
-    joinThread(serverThread)
-  else:
-    httpServer.serve(endpoint.port, endpoint.address)
+  shouldRun = false
+  httpServer.close()
+  joinThread(serverThread)
 
 proc runOrchestratorForTicks*(repoPath: string, maxTicks: int) =
   ## Run the orchestrator loop for a bounded number of ticks. Used by tests.

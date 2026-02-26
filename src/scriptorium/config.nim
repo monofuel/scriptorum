@@ -1,5 +1,6 @@
-import std/[os, strutils]
-import jsony
+import
+  std/[os, strutils],
+  jsony
 
 const
   ConfigFile = "scriptorium.json"
