@@ -1,7 +1,7 @@
 ## Tests for the scriptorium CLI and core utilities.
 
 import std/[unittest, os, osproc, strutils]
-import scriptorium/[init]
+import scriptorium/[init, config]
 
 proc makeTestRepo(path: string) =
   ## Create a minimal git repository at path suitable for testing.
@@ -53,3 +53,37 @@ suite "scriptorium --init":
 
     expect ValueError:
       runInit(tmp)
+
+suite "config":
+  test "defaults to codex-mini for both roles":
+    let cfg = defaultConfig()
+    check cfg.models.architect == "codex-mini"
+    check cfg.models.coding == "codex-mini"
+
+  test "loads from scriptorium.json":
+    let tmp = getTempDir() / "scriptorium_test_config"
+    createDir(tmp)
+    defer: removeDir(tmp)
+    writeFile(tmp / "scriptorium.json", """{"models":{"architect":"claude-opus-4-6","coding":"grok-code-fast-1"},"endpoints":{"local":"http://localhost:1234/v1"}}""")
+
+    let cfg = loadConfig(tmp)
+    check cfg.models.architect == "claude-opus-4-6"
+    check cfg.models.coding == "grok-code-fast-1"
+    check cfg.endpoints.local == "http://localhost:1234/v1"
+
+  test "missing file returns defaults":
+    let tmp = getTempDir() / "scriptorium_test_config_missing"
+    createDir(tmp)
+    defer: removeDir(tmp)
+
+    let cfg = loadConfig(tmp)
+    check cfg.models.architect == "codex-mini"
+    check cfg.models.coding == "codex-mini"
+
+  test "harness routing":
+    check harness("claude-opus-4-6") == harnessClaudeCode
+    check harness("claude-haiku-4-5") == harnessClaudeCode
+    check harness("codex-mini") == harnessCodex
+    check harness("gpt-4o") == harnessCodex
+    check harness("grok-code-fast-1") == harnessTypoi
+    check harness("local/qwen3.5-35b-a3b") == harnessTypoi
