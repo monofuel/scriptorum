@@ -56,3 +56,31 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/scriptorium-linux-x86_64
+
+  release-master:
+    runs-on: ubuntu-latest
+    needs: linux-binary
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update rolling release tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa master-latest -m "Latest master build" "${GITHUB_SHA}"
+          git push origin refs/tags/master-latest --force
+      - name: Download linux binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: scriptorium-linux-x86_64
+          path: dist
+      - name: Publish rolling master release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: master-latest
+          name: master-latest
+          prerelease: true
+          files: dist/scriptorium-linux-x86_64
