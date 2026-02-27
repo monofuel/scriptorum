@@ -341,6 +341,30 @@ suite "orchestrator invariants":
     expect ValueError:
       validateTransitionCommitInvariant(tmp)
 
+  test "simulated crash during ticket move keeps prior valid state":
+    let tmp = getTempDir() / "scriptorium_test_invariant_no_partial_move_on_crash"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+    let before = planCommitCount(tmp)
+
+    expect IOError:
+      withPlanWorktree(tmp, "simulated_crash_partial_move", proc(planPath: string) =
+        moveFile(
+          planPath / "tickets/open/0001-first.md",
+          planPath / "tickets/in-progress/0001-first.md",
+        )
+        raise newException(IOError, "simulated crash before commit")
+      )
+
+    let files = planTreeFiles(tmp)
+    let after = planCommitCount(tmp)
+    check "tickets/open/0001-first.md" in files
+    check "tickets/in-progress/0001-first.md" notin files
+    check after == before
+    validateTicketStateInvariant(tmp)
+
 suite "orchestrator planning bootstrap":
   test "loads spec from plan branch":
     let tmp = getTempDir() / "scriptorium_test_plan_load_spec"
