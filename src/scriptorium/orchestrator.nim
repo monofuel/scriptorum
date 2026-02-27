@@ -321,6 +321,16 @@ proc runArchitectSpecUpdate(repoPath: string, model: string, currentSpec: string
 
 proc listMarkdownFiles(basePath: string): seq[string]
 
+proc ensureUniqueTicketStateInPlanPath(planPath: string) =
+  ## Ensure each ticket markdown filename exists in exactly one state directory.
+  var seen = initHashSet[string]()
+  for stateDir in [PlanTicketsOpenDir, PlanTicketsInProgressDir, PlanTicketsDoneDir]:
+    for ticketPath in listMarkdownFiles(planPath / stateDir):
+      let fileName = extractFilename(ticketPath)
+      if seen.contains(fileName):
+        raise newException(ValueError, fmt"ticket exists in multiple state directories: {fileName}")
+      seen.incl(fileName)
+
 proc runCommandCapture(workingDir: string, command: string, args: seq[string]): tuple[exitCode: int, output: string] =
   ## Run a process and return combined stdout/stderr with its exit code.
   let process = startProcess(
@@ -739,6 +749,13 @@ proc oldestOpenTicket*(repoPath: string): string =
   ## Return the oldest open ticket path in the plan branch.
   result = withPlanWorktree(repoPath, proc(planPath: string): string =
     oldestOpenTicketInPlanPath(planPath)
+  )
+
+proc validateTicketStateInvariant*(repoPath: string) =
+  ## Validate that no ticket markdown filename exists in more than one state directory.
+  discard withPlanWorktree(repoPath, proc(planPath: string): int =
+    ensureUniqueTicketStateInPlanPath(planPath)
+    0
   )
 
 proc listActiveTicketWorktrees*(repoPath: string): seq[ActiveTicketWorktree] =

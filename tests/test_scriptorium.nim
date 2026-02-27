@@ -308,6 +308,18 @@ suite "orchestrator plan spec update":
     check logRc == 0
     check "scriptorium: update spec from architect" in logOutput
 
+suite "orchestrator invariants":
+  test "ticket state invariant fails when same ticket exists in multiple state directories":
+    let tmp = getTempDir() / "scriptorium_test_invariant_duplicate_ticket_states"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+    addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+    addTicketToPlan(tmp, "done", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+
+    expect ValueError:
+      validateTicketStateInvariant(tmp)
+
 suite "orchestrator planning bootstrap":
   test "loads spec from plan branch":
     let tmp = getTempDir() / "scriptorium_test_plan_load_spec"
