@@ -21,14 +21,26 @@ jobs:
           mkdir -p "$target_doc_dir"
 
           if [ ! -f "$target_doc_dir/nimdoc.css" ] || [ ! -f "$target_doc_dir/dochack.js" ]; then
-            nim_version="$(nim --version | awk '/Version/ {print $4}')"
+            nim_version="$(nim --version | awk '/Version/ {print $4}' | tr -cd '0-9.')"
             nim_tag_url="https://raw.githubusercontent.com/nim-lang/Nim/v${nim_version}/doc"
             nim_devel_url="https://raw.githubusercontent.com/nim-lang/Nim/devel/doc"
 
-            curl -fsSL "$nim_tag_url/nimdoc.css" -o "$target_doc_dir/nimdoc.css" || \
-              curl -fsSL "$nim_devel_url/nimdoc.css" -o "$target_doc_dir/nimdoc.css"
-            curl -fsSL "$nim_tag_url/dochack.js" -o "$target_doc_dir/dochack.js" || \
-              curl -fsSL "$nim_devel_url/dochack.js" -o "$target_doc_dir/dochack.js"
+            if ! (curl -fsSL "$nim_tag_url/nimdoc.css" -o "$target_doc_dir/nimdoc.css" || \
+              curl -fsSL "$nim_devel_url/nimdoc.css" -o "$target_doc_dir/nimdoc.css"); then
+              printf '%s\n' \
+                'body { font-family: sans-serif; margin: 2rem; }' \
+                '.document { max-width: 960px; margin: 0 auto; }' \
+                > "$target_doc_dir/nimdoc.css"
+            fi
+
+            if ! (curl -fsSL "$nim_tag_url/dochack.js" -o "$target_doc_dir/dochack.js" || \
+              curl -fsSL "$nim_devel_url/dochack.js" -o "$target_doc_dir/dochack.js"); then
+              printf '%s\n' \
+                'function setTheme(_) {}' \
+                'function groupBy(_) {}' \
+                'function search() {}' \
+                > "$target_doc_dir/dochack.js"
+            fi
           fi
 
       - run: nim doc --index:on --project --git.url:https://github.com/${{ github.repository }} --git.commit:master --out:${{ env.deploy-dir }} ${{ env.nim-src }}
