@@ -56,6 +56,13 @@ type
   ManagerTicketGenerator* = proc(model: string, areaPath: string, areaContent: string): seq[TicketDocument]
   ArchitectSpecUpdater* = proc(model: string, currentSpec: string, prompt: string): string
 
+  PlanTurn* = object
+    role*: string
+    text*: string
+
+  PlanSessionInput* = proc(): string
+    ## Returns the next line of input. Raises EOFError to end the session.
+
   TicketAssignment* = object
     openTicket*: string
     inProgressTicket*: string
@@ -1314,6 +1321,102 @@ proc runOrchestratorForTicks*(repoPath: string, maxTicks: int) =
   let endpoint = loadOrchestratorEndpoint(repoPath)
   let httpServer = createOrchestratorServer()
   runOrchestratorLoop(repoPath, httpServer, endpoint, maxTicks)
+
+proc buildInteractivePlanPrompt*(spec: string, history: seq[PlanTurn], userMsg: string): string =
+  ## Assemble the multi-turn architect prompt with spec, history, and current message.
+  result =
+    "You are the Architect for scriptorium.\n" &
+    "Update spec.md based on the user request.\n" &
+    "You may edit spec.md directly using your file tools.\n\n" &
+    "Current spec.md:\n" &
+    spec.strip() & "\n"
+
+  if history.len > 0:
+    result &= "\nConversation history:\n"
+    for turn in history:
+      result &= fmt"\n[{turn.role}]: {turn.text.strip()}\n"
+
+  result &= fmt"\n[engineer]: {userMsg.strip()}\n"
+
+proc runInteractivePlanSession*(
+  repoPath: string,
+  runner: AgentRunner = runAgent,
+  input: PlanSessionInput = nil,
+) =
+  ## Run a multi-turn interactive planning session with the Architect.
+  let cfg = loadConfig(repoPath)
+  discard withPlanWorktree(repoPath, proc(planPath: string): int =
+    echo "scriptorium: interactive planning session (type /help for commands, /quit to exit)"
+    var history: seq[PlanTurn] = @[]
+    var turnNum = 0
+
+    while true:
+      stdout.write("> ")
+      flushFile(stdout)
+      var line: string
+      try:
+        if input.isNil:
+          line = readLine(stdin)
+        else:
+          line = input()
+      except EOFError:
+        break
+
+      line = line.strip()
+      if line.len == 0:
+        continue
+
+      case line
+      of "/quit", "/exit":
+        break
+      of "/show":
+        let specPath = planPath / PlanSpecPath
+        if fileExists(specPath):
+          echo readFile(specPath)
+        else:
+          echo "scriptorium: spec.md not found"
+        continue
+      of "/help":
+        echo "/show  — print current spec.md"
+        echo "/quit  — exit the session"
+        echo "/help  — show this list"
+        continue
+      else:
+        if line.startsWith("/"):
+          echo fmt"scriptorium: unknown command '{line}'"
+          continue
+
+      let prevSpec = readFile(planPath / PlanSpecPath)
+      inc turnNum
+      let prompt = buildInteractivePlanPrompt(prevSpec, history, line)
+      let agentResult = runner(AgentRunRequest(
+        prompt: prompt,
+        workingDir: planPath,
+        model: cfg.models.architect,
+        ticketId: "plan-session",
+        attempt: 1,
+        skipGitRepoCheck: true,
+        maxAttempts: 1,
+        noOutputTimeoutMs: 120_000,
+        hardTimeoutMs: 300_000,
+      ))
+
+      var response = agentResult.lastMessage.strip()
+      if response.len == 0:
+        response = agentResult.stdout.strip()
+      if response.len > 0:
+        echo response
+
+      history.add(PlanTurn(role: "engineer", text: line))
+      history.add(PlanTurn(role: "architect", text: response))
+
+      let newSpec = readFile(planPath / PlanSpecPath)
+      if newSpec != prevSpec:
+        gitRun(planPath, "add", PlanSpecPath)
+        gitRun(planPath, "commit", "-m", fmt"scriptorium: plan session turn {turnNum}")
+        echo fmt"[spec.md updated — turn {turnNum}]"
+    0
+  )
 
 proc runOrchestrator*(repoPath: string) =
   ## Start the orchestrator daemon with HTTP MCP and an idle event loop.

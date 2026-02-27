@@ -10,7 +10,8 @@ Usage:
   scriptorium --init [path]    Initialize a new scriptorium workspace
   scriptorium run              Start the orchestrator daemon
   scriptorium status           Show ticket counts and agent activity
-  scriptorium plan <prompt>    Ask the Architect to revise spec.md
+  scriptorium plan             Interactive Architect conversation to build/revise spec.md
+  scriptorium plan <prompt>    One-shot: ask the Architect to revise spec.md
   scriptorium worktrees        List active git worktrees and their tickets
   scriptorium --version        Print version
   scriptorium --help           Show this help"""
@@ -41,15 +42,16 @@ proc cmdStatus() =
       echo "Active Agent Worktree: unknown"
 
 proc cmdPlan(args: seq[string]) =
-  ## Ask the architect model to revise spec.md using a prompt.
+  ## Ask the architect model to revise spec.md, interactively or one-shot.
   if args.len == 0:
-    raise newException(ValueError, "plan prompt is required")
-  let prompt = args.join(" ").strip()
-  let changed = updateSpecFromArchitect(getCurrentDir(), prompt)
-  if changed:
-    echo "scriptorium: updated spec.md on scriptorium/plan"
+    runInteractivePlanSession(getCurrentDir())
   else:
-    echo "scriptorium: spec.md unchanged"
+    let prompt = args.join(" ").strip()
+    let changed = updateSpecFromArchitect(getCurrentDir(), prompt)
+    if changed:
+      echo "scriptorium: updated spec.md on scriptorium/plan"
+    else:
+      echo "scriptorium: spec.md unchanged"
 
 proc cmdWorktrees() =
   ## List active git worktrees and which tickets they belong to.

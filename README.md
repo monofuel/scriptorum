@@ -268,7 +268,8 @@ scriptorium --init [path]      Initialize a new scriptorium workspace
 scriptorium --import [path]    Adopt an existing repo (later version)
 scriptorium run                Start the orchestrator (reads current spec, drives work)
 scriptorium status             Show ticket counts and current agent activity
-scriptorium plan               Conversation with the Architect to build or revise spec.md
+scriptorium plan               Interactive Architect conversation to build or revise spec.md
+scriptorium plan <prompt>      One-shot: ask the Architect to revise spec.md
 scriptorium worktrees          List active git worktrees and which tickets they belong to
 ```
 
@@ -330,10 +331,19 @@ All other tickets continue if they are unaffected by the block.
 
 ### `scriptorium plan`
 
-Opens an interactive conversation with the Architect in the terminal. This is the primary
-— and ideally only — interface between the human engineer and the scriptorium system. The user
-should be able to describe what they want in plain language and trust the Architect to
-translate it into spec changes, new areas, and updated tickets.
+`scriptorium plan` (no args) opens a multi-turn interactive conversation with the Architect
+in the terminal. Each turn, you type a message; the Architect reads and optionally edits
+`spec.md` directly in the plan worktree. If `spec.md` changes, it is committed automatically
+after that turn. Type `/quit` to exit; `/show` to print the current spec; `/help` for a
+command list.
+
+`scriptorium plan <prompt>` is the one-shot automation path: a single Architect call
+rewrites `spec.md` and commits if the content changed.
+
+The interactive mode is the primary — and ideally only — interface between the human
+engineer and the scriptorium system. The user should be able to describe what they want in
+plain language and trust the Architect to translate it into spec changes, new areas, and
+updated tickets.
 
 The Architect in `scriptorium plan` has full read access to the plan branch: current `spec.md`,
 all area files, all tickets (open, in-progress, done), and any pending escalations. It can

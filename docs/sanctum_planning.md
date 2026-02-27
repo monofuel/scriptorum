@@ -84,26 +84,26 @@ give `scriptorium plan` its own dedicated worktree checkout.
 
 ## Implementation Plan
 
-- [ ] `SP-01` Add CLI mode split:
+- [x] `SP-01` Add CLI mode split:
   - `scriptorium plan` (no args) → interactive mode.
   - `scriptorium plan <prompt...>` → existing one-shot path, unchanged.
   - Entry point: `src/scriptorium.nim`; one-shot path calls `updateSpecFromArchitect`.
   - Test: CLI parsing test verifies both routes.
 
-- [ ] `SP-02` Use plan worktree as Codex working directory:
+- [x] `SP-02` Use plan worktree as Codex working directory:
   - Pass the existing plan branch worktree path as `workingDir` to `runAgent` each turn.
   - After each turn, compare `spec.md` content to the pre-turn snapshot; if changed,
     commit to the plan branch with message `scriptorium: plan session turn <N>`.
   - Test: unit test verifies a changed `spec.md` produces a commit and unchanged does not.
 
-- [ ] `SP-03` Add conversation loop and prompt assembly:
+- [x] `SP-03` Add conversation loop and prompt assembly:
   - Maintain an in-memory seq of `(role, text)` turn pairs.
   - Build the Codex prompt from: architect system prompt + current `spec.md` content +
     prior turns + current user message.
   - Run `runAgent` for each user turn; display the last message as the response.
   - Test: unit test with a fake agent runner verifies prompt assembly and turn recording.
 
-- [ ] `SP-04` Add REPL command handlers:
+- [x] `SP-04` Add REPL command handlers:
   - `/show` — read and print current `spec.md`.
   - `/quit` — exit the session cleanly.
   - `/help` — print command list.

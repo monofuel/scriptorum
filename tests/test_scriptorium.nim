@@ -816,3 +816,121 @@ suite "orchestrator merge queue":
     )
     check ticketRc == 0
     check "## Merge Queue Failure" in ticketContent
+
+suite "interactive planning":
+  test "prompt assembly includes spec, history, and user message":
+    let spec = "# Spec\n\n- feature A\n"
+    let history = @[
+      PlanTurn(role: "engineer", text: "add feature B"),
+      PlanTurn(role: "architect", text: "Added feature B to spec."),
+    ]
+    let userMsg = "add feature C"
+
+    let prompt = buildInteractivePlanPrompt(spec, history, userMsg)
+
+    check spec.strip() in prompt
+    check "add feature B" in prompt
+    check "Added feature B to spec." in prompt
+    check "add feature C" in prompt
+
+  test "turn commits when spec changes":
+    let tmp = getTempDir() / "scriptorium_test_interactive_commit"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+
+    var callCount = 0
+    proc fakeRunner(req: AgentRunRequest): AgentRunResult =
+      ## Write new content to spec.md and return a deterministic result.
+      inc callCount
+      writeFile(req.workingDir / "spec.md", "# Updated Spec\n\n- new item\n")
+      result = AgentRunResult(
+        backend: harnessCodex,
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        lastMessage: "Updated spec.",
+        timeoutKind: "none",
+      )
+
+    var msgIdx = 0
+    proc fakeInput(): string =
+      ## Yield one message then raise EOFError.
+      if msgIdx >= 1:
+        raise newException(EOFError, "done")
+      inc msgIdx
+      result = "hello"
+
+    runInteractivePlanSession(tmp, fakeRunner, fakeInput)
+
+    let (logOutput, logRc) = execCmdEx(
+      "git -C " & quoteShell(tmp) & " log --oneline scriptorium/plan"
+    )
+    check logRc == 0
+    check "plan session turn 1" in logOutput
+    check callCount == 1
+
+  test "turn makes no commit when spec unchanged":
+    let tmp = getTempDir() / "scriptorium_test_interactive_no_commit"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+
+    proc fakeRunner(req: AgentRunRequest): AgentRunResult =
+      ## Return a result without modifying spec.md.
+      discard req
+      result = AgentRunResult(
+        backend: harnessCodex,
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        lastMessage: "No changes needed.",
+        timeoutKind: "none",
+      )
+
+    var msgIdx = 0
+    proc fakeInput(): string =
+      ## Yield one message then raise EOFError.
+      if msgIdx >= 1:
+        raise newException(EOFError, "done")
+      inc msgIdx
+      result = "hello"
+
+    let before = planCommitCount(tmp)
+    runInteractivePlanSession(tmp, fakeRunner, fakeInput)
+    let after = planCommitCount(tmp)
+
+    check after == before
+
+  test "/show, /help, /quit do not invoke runner":
+    let tmp = getTempDir() / "scriptorium_test_interactive_commands"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp)
+
+    var callCount = 0
+    proc fakeRunner(req: AgentRunRequest): AgentRunResult =
+      ## Count invocations; should never be called for slash commands.
+      inc callCount
+      discard req
+      result = AgentRunResult(
+        backend: harnessCodex,
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        lastMessage: "",
+        timeoutKind: "none",
+      )
+
+    let cmds = @["/show", "/help", "/quit"]
+    var cmdIdx = 0
+    proc fakeInput(): string =
+      ## Yield slash commands in sequence, then EOF.
+      if cmdIdx >= cmds.len:
+        raise newException(EOFError, "done")
+      result = cmds[cmdIdx]
+      inc cmdIdx
+
+    runInteractivePlanSession(tmp, fakeRunner, fakeInput)
+
+    check callCount == 0
