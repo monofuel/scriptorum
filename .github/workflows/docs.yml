@@ -15,6 +15,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: treeform/setup-nim-action@v6
       - run: nimby sync -g nimby.lock
+      - name: Ensure nimdoc assets exist
+        run: |
+          target_doc_dir="$HOME/.nimby/nim/doc"
+          mkdir -p "$target_doc_dir"
+
+          if [ ! -f "$target_doc_dir/nimdoc.css" ] || [ ! -f "$target_doc_dir/dochack.js" ]; then
+            css_source="$(find "$HOME/.nimby" -path '*/doc/nimdoc.css' | head -n 1)"
+            js_source="$(find "$HOME/.nimby" -path '*/doc/dochack.js' | head -n 1)"
+
+            if [ -z "$css_source" ] || [ -z "$js_source" ]; then
+              echo "Could not locate nimdoc assets under ~/.nimby."
+              echo "Expected files: nimdoc.css and dochack.js"
+              exit 1
+            fi
+
+            cp "$css_source" "$target_doc_dir/nimdoc.css"
+            cp "$js_source" "$target_doc_dir/dochack.js"
+          fi
+
       - run: nim doc --index:on --project --git.url:https://github.com/${{ github.repository }} --git.commit:master --out:${{ env.deploy-dir }} ${{ env.nim-src }}
       - name: "Copy to index.html"
         run: cp ${{ env.deploy-dir }}/scriptorium.html ${{ env.deploy-dir }}/index.html
