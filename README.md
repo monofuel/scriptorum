@@ -118,6 +118,32 @@ Interactive planning commands:
 scriptorium run
 ```
 
+### 7) Logging
+
+`scriptorium run` writes a human-readable log file per session to:
+
+```text
+/tmp/scriptorium/{project_name}/run_{datetime}.log
+```
+
+- `{project_name}` is the repo directory name (e.g. `scriptorium`)
+- `{datetime}` is a UTC timestamp like `2026-02-28T14-30-00Z`
+- The directory is created automatically on startup
+
+Every log line is written to both stdout and the log file with the format:
+
+```text
+[2026-02-28T14:30:00Z] [INFO] orchestrator listening on http://127.0.0.1:8097
+```
+
+Log levels: `DEBUG`, `INFO`, `WARN`, `ERROR`. Logged events include orchestrator startup, tick activity, architect/manager/coding-agent results, merge queue processing, master health checks, and shutdown signals.
+
+To follow a live session:
+
+```bash
+tail -f /tmp/scriptorium/myproject/run_*.log
+```
+
 ## CLI reference
 
 ```text
