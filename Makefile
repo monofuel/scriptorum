@@ -1,6 +1,6 @@
 .PHONY: test integration-test build ci
 
-build: scripotorium
+build: scriptorium
 
 scriptorium: src/scriptorium.nim
 	nim c -o:scriptorium src/scriptorium.nim
