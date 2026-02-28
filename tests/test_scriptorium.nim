@@ -28,6 +28,10 @@ proc runCmdOrDie(cmd: string) =
   let (_, rc) = execCmdEx(cmd)
   doAssert rc == 0, cmd
 
+proc normalizedPathForTest(path: string): string =
+  ## Return an absolute path with forward slash separators for assertions.
+  result = absolutePath(path).replace('\\', '/')
+
 proc writeScriptoriumConfig(repoPath: string, cfg: Config) =
   ## Write one typed scriptorium.json payload for test configuration.
   writeFile(repoPath / "scriptorium.json", cfg.toJson())
@@ -402,23 +406,39 @@ suite "orchestrator plan spec update":
     check after == before
     check "areas/01-out-of-scope.md" notin files
 
-  test "updateSpecFromArchitect recovers stale managed temp worktree conflicts":
+  test "updateSpecFromArchitect recovers stale managed deterministic worktree conflicts":
     let tmp = getTempDir() / "scriptorium_test_plan_stale_temp_conflict"
     makeTestRepo(tmp)
     defer: removeDir(tmp)
     runInit(tmp, quiet = true)
 
-    let stalePath = createTempDir("scriptorium_plan_", "", getTempDir())
-    removeDir(stalePath)
-    runCmdOrDie("git -C " & quoteShell(tmp) & " worktree add " & quoteShell(stalePath) & " scriptorium/plan")
+    var managedPlanPath = ""
+    proc bootstrapRunner(req: AgentRunRequest): AgentRunResult =
+      ## Capture the deterministic managed plan worktree path.
+      managedPlanPath = req.workingDir
+      writeFile(req.workingDir / "spec.md", "# Updated Spec\n\n- bootstrap\n")
+      result = AgentRunResult(
+        backend: harnessCodex,
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        lastMessage: "done",
+        timeoutKind: "none",
+      )
+    discard updateSpecFromArchitect(tmp, "bootstrap managed path", bootstrapRunner)
+    check managedPlanPath.len > 0
+    check "/worktrees/plan" in normalizedPathForTest(managedPlanPath)
+
+    runCmdOrDie("git -C " & quoteShell(tmp) & " worktree add " & quoteShell(managedPlanPath) & " scriptorium/plan")
     defer:
-      discard execCmdEx("git -C " & quoteShell(tmp) & " worktree remove --force " & quoteShell(stalePath))
+      discard execCmdEx("git -C " & quoteShell(tmp) & " worktree remove --force " & quoteShell(managedPlanPath))
       discard execCmdEx("git -C " & quoteShell(tmp) & " worktree prune")
-      if dirExists(stalePath):
-        removeDir(stalePath)
+      if dirExists(managedPlanPath):
+        removeDir(managedPlanPath)
+    removeDir(managedPlanPath)
 
     proc fakeRunner(req: AgentRunRequest): AgentRunResult =
-      ## Update spec.md in the recovered temp worktree.
+      ## Update spec.md in the recovered deterministic worktree.
       writeFile(req.workingDir / "spec.md", "# Updated Spec\n\n- recovered\n")
       result = AgentRunResult(
         backend: harnessCodex,
@@ -433,7 +453,7 @@ suite "orchestrator plan spec update":
     let worktrees = gitWorktreePaths(tmp)
 
     check changed
-    check stalePath notin worktrees
+    check managedPlanPath notin worktrees
 
   test "updateSpecFromArchitect keeps non-managed plan worktree conflicts intact":
     let tmp = getTempDir() / "scriptorium_test_plan_manual_conflict"
@@ -475,6 +495,64 @@ suite "orchestrator plan spec update":
     check runnerCalls == 0
     check "already used by worktree" in errorMessage
     check manualPath in worktrees
+
+  test "updateSpecFromArchitect fails fast when planner lock is held":
+    let tmp = getTempDir() / "scriptorium_test_plan_lock_busy"
+    makeTestRepo(tmp)
+    defer: removeDir(tmp)
+    runInit(tmp, quiet = true)
+
+    var managedPlanPath = ""
+    proc bootstrapRunner(req: AgentRunRequest): AgentRunResult =
+      ## Capture deterministic plan path so tests can derive lock location.
+      managedPlanPath = req.workingDir
+      writeFile(req.workingDir / "spec.md", "# Updated Spec\n\n- bootstrap\n")
+      result = AgentRunResult(
+        backend: harnessCodex,
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        lastMessage: "done",
+        timeoutKind: "none",
+      )
+    discard updateSpecFromArchitect(tmp, "bootstrap lock path", bootstrapRunner)
+    check managedPlanPath.len > 0
+
+    let managedRepoRoot = parentDir(parentDir(managedPlanPath))
+    let lockPath = managedRepoRoot / "locks/repo.lock"
+    createDir(parentDir(lockPath))
+    createDir(lockPath)
+    let pidPath = lockPath / "pid"
+    let currentPid = getCurrentProcessId()
+    writeFile(pidPath, $currentPid & "\n")
+    defer:
+      if fileExists(pidPath):
+        removeFile(pidPath)
+      if dirExists(lockPath):
+        removeDir(lockPath)
+
+    var runnerCalls = 0
+    proc fakeRunner(req: AgentRunRequest): AgentRunResult =
+      ## Track invocations; lock contention should fail before runner starts.
+      inc runnerCalls
+      discard req
+      result = AgentRunResult(
+        backend: harnessCodex,
+        exitCode: 0,
+        attempt: 1,
+        attemptCount: 1,
+        lastMessage: "",
+        timeoutKind: "none",
+      )
+
+    var errorMessage = ""
+    try:
+      discard updateSpecFromArchitect(tmp, "blocked by lock", fakeRunner)
+    except IOError as err:
+      errorMessage = err.msg
+
+    check runnerCalls == 0
+    check "another planner/manager is active" in errorMessage
 
 suite "orchestrator invariants":
   test "ticket state invariant fails when same ticket exists in multiple state directories":
@@ -773,9 +851,14 @@ suite "orchestrator ticket assignment":
     addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
 
     let assignment = assignOldestOpenTicket(tmp)
+    let normalizedWorktreePath = normalizedPathForTest(assignment.worktree)
+    let normalizedManagedRoot = normalizedPathForTest(getTempDir() / "scriptorium")
+    let normalizedRepoPath = normalizedPathForTest(tmp)
     check assignment.worktree.len > 0
     check assignment.branch == "scriptorium/ticket-0001"
     check assignment.worktree in gitWorktreePaths(tmp)
+    check normalizedWorktreePath.startsWith(normalizedManagedRoot & "/")
+    check not normalizedWorktreePath.startsWith(normalizedRepoPath & "/")
 
     let (ticketContent, rc) = execCmdEx(
       "git -C " & quoteShell(tmp) & " show scriptorium/plan:tickets/in-progress/0001-first.md"

@@ -21,7 +21,7 @@ At a high level:
 1. Engineer creates or revises `spec.md` with `scriptorium plan`.
 2. Orchestrator reads `spec.md` and generates `areas/*.md` (Architect).
 3. Orchestrator generates `tickets/open/*.md` from areas (Manager).
-4. Oldest open ticket is assigned to a ticket worktree and moved to `tickets/in-progress/`.
+4. Oldest open ticket is assigned to a deterministic `/tmp/scriptorium/<repo-key>/worktrees/tickets/<ticket>/` worktree and moved to `tickets/in-progress/`.
 5. Coding agent implements the ticket and signals completion via `submit_pr("...")`.
 6. Merge queue processes one item at a time:
    - merge `master` into ticket branch
@@ -103,9 +103,10 @@ scriptorium plan "Add CI checks for merge queue invariants"
 ```
 
 Planning execution model (both modes):
-- Architect runs in a temporary `scriptorium/plan` worktree.
+- Architect runs in a deterministic `/tmp/scriptorium/<repo-key>/worktrees/plan` worktree.
 - Prompt includes repo-root path so Architect can read project source.
 - Post-run write guard allows only `spec.md`; any other file edits fail the command.
+- Planner/manager writes are single-flight via `/tmp/scriptorium/<repo-key>/locks/repo.lock`; concurrent planner/manager runs fail fast.
 
 Interactive planning commands:
 - `/show` prints current `spec.md`

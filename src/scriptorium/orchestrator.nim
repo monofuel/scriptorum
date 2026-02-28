@@ -1,5 +1,5 @@
 import
-  std/[algorithm, os, osproc, posix, sets, streams, strformat, strutils, tables, tempfiles, uri],
+  std/[algorithm, os, osproc, posix, sets, streams, strformat, strutils, tables, uri],
   mcport,
   ./[agent_runner, config, logging, prompt_catalog]
 
@@ -28,8 +28,15 @@ const
   PlanSpecCommitMessage = "scriptorium: update spec from architect"
   PlanSpecTicketId = "plan-spec"
   PlanSessionTicketId = "plan-session"
-  PlanTempWorktreePrefix = "scriptorium_plan_"
-  ManagedWorktreeRoot = ".scriptorium/worktrees"
+  ManagedStateRootDirName = "scriptorium"
+  ManagedWorktreeDirName = "worktrees"
+  ManagedPlanWorktreeName = "plan"
+  ManagedMasterWorktreeName = "master"
+  ManagedTicketWorktreeDirName = "tickets"
+  ManagedLockDirName = "locks"
+  ManagedRepoLockName = "repo.lock"
+  ManagedRepoLockPidFileName = "pid"
+  LegacyManagedWorktreeRoot = ".scriptorium/worktrees"
   PlanLogRoot = "scriptorium-plan-logs"
   PlanWriteScopeName = "scriptorium plan"
   ManagerWriteScopeName = "scriptorium manager"
@@ -143,47 +150,157 @@ proc gitCheck(dir: string, args: varargs[string]): int =
 
 proc parseWorktreeConflictPath(output: string): string =
   ## Extract a conflicting worktree path from git worktree add stderr output.
-  let marker = "worktree at '"
-  let markerPos = output.rfind(marker)
-  if markerPos >= 0:
-    let pathStart = markerPos + marker.len
+  let usedMarker = "worktree at '"
+  let usedMarkerPos = output.rfind(usedMarker)
+  if usedMarkerPos >= 0:
+    let pathStart = usedMarkerPos + usedMarker.len
     let pathEnd = output.find('\'', pathStart)
     if pathEnd > pathStart:
       result = output[pathStart..<pathEnd].strip()
+      return
 
-proc isManagedPlanTempWorktreePath(path: string): bool =
-  ## Return true when path is one of this tool's temporary plan worktrees.
-  var tempRoot = absolutePath(getTempDir()).replace('\\', '/')
-  if tempRoot.endsWith("/"):
-    tempRoot.setLen(tempRoot.len - 1)
+  let registeredMarker = "fatal: '"
+  let registeredMarkerPos = output.rfind(registeredMarker)
+  if registeredMarkerPos >= 0:
+    let pathStart = registeredMarkerPos + registeredMarker.len
+    let missingMarker = "' is a missing but already registered worktree"
+    let pathEnd = output.find(missingMarker, pathStart)
+    if pathEnd > pathStart:
+      result = output[pathStart..<pathEnd].strip()
 
-  let normalizedPath = absolutePath(path).replace('\\', '/')
-  result = normalizedPath.startsWith(tempRoot & "/" & PlanTempWorktreePrefix)
+proc normalizeAbsolutePath(path: string): string =
+  ## Return a normalized absolute path that always uses forward slashes.
+  result = absolutePath(path).replace('\\', '/')
 
-proc recoverManagedPlanWorktreeConflict(repoPath: string, addOutput: string): bool =
-  ## Remove a stale managed temp worktree conflict and prune stale worktree metadata.
+proc repoStateKey(repoPath: string): string =
+  ## Build a deterministic state key from one repository absolute path.
+  let canonicalRepoPath = normalizeAbsolutePath(repoPath)
+  let rawRepoName = extractFilename(canonicalRepoPath)
+  let repoName = if rawRepoName.len > 0: rawRepoName else: "repo"
+
+  var hashValue = 1469598103934665603'u64
+  for ch in canonicalRepoPath:
+    hashValue = (hashValue xor uint64(ord(ch))) * 1099511628211'u64
+  let hashText = toLowerAscii(toHex(hashValue, 16))
+  result = repoName.toLowerAscii() & "-" & hashText
+
+proc managedRepoRootPath(repoPath: string): string =
+  ## Return the deterministic managed state root path in /tmp for one repository.
+  let repoKey = repoStateKey(repoPath)
+  result = absolutePath(getTempDir() / ManagedStateRootDirName / repoKey)
+
+proc managedWorktreeRootPath(repoPath: string): string =
+  ## Return the deterministic managed worktree root path in /tmp for one repository.
+  result = managedRepoRootPath(repoPath) / ManagedWorktreeDirName
+
+proc managedPlanWorktreePath(repoPath: string): string =
+  ## Return the deterministic plan worktree path in /tmp for one repository.
+  result = managedWorktreeRootPath(repoPath) / ManagedPlanWorktreeName
+
+proc managedMasterWorktreePath(repoPath: string): string =
+  ## Return the deterministic master worktree path in /tmp for one repository.
+  result = managedWorktreeRootPath(repoPath) / ManagedMasterWorktreeName
+
+proc managedTicketWorktreeRootPath(repoPath: string): string =
+  ## Return the deterministic ticket worktree root path in /tmp for one repository.
+  result = managedWorktreeRootPath(repoPath) / ManagedTicketWorktreeDirName
+
+proc managedRepoLockPath(repoPath: string): string =
+  ## Return the deterministic repository lock path in /tmp for one repository.
+  result = managedRepoRootPath(repoPath) / ManagedLockDirName / ManagedRepoLockName
+
+proc isManagedWorktreePath(repoPath: string, path: string): bool =
+  ## Return true when path is under this repository's managed /tmp worktree root.
+  let managedRoot = normalizeAbsolutePath(managedWorktreeRootPath(repoPath))
+  let normalizedPath = normalizeAbsolutePath(path)
+  result = normalizedPath.startsWith(managedRoot & "/")
+
+proc lockHolderPid(lockPath: string): int =
+  ## Return lock holder PID from pid file when present and valid.
+  let pidPath = lockPath / ManagedRepoLockPidFileName
+  if fileExists(pidPath):
+    let pidText = readFile(pidPath).strip()
+    if pidText.len > 0 and pidText.allCharsInSet(Digits):
+      result = parseInt(pidText)
+
+proc lockPathIsStale(lockPath: string): bool =
+  ## Return true when lock path exists but holder PID is no longer alive.
+  let holderPid = lockHolderPid(lockPath)
+  if holderPid <= 0:
+    result = false
+  else:
+    let killRc = posix.kill(Pid(holderPid), 0)
+    if killRc == 0:
+      result = false
+    else:
+      let errCode = int(osLastError())
+      result = errCode == ESRCH
+
+proc tryAcquireRepoLock(lockPath: string): bool =
+  ## Attempt to create one repository lock directory and return true when acquired.
+  let mkdirRc = posix.mkdir(lockPath.cstring, Mode(0o700))
+  if mkdirRc == 0:
+    result = true
+  else:
+    let errCode = int(osLastError())
+    if errCode == EEXIST:
+      result = false
+    else:
+      let errNo = osLastError()
+      let errText = osErrorMsg(errNo)
+      raise newException(IOError, &"failed to create repo lock at {lockPath}: {errText}")
+
+proc withRepoLock[T](repoPath: string, operation: proc(): T): T =
+  ## Acquire a per-repository lock for planner and manager writes.
+  let lockPath = managedRepoLockPath(repoPath)
+  createDir(parentDir(lockPath))
+
+  var acquired = tryAcquireRepoLock(lockPath)
+  if not acquired and lockPathIsStale(lockPath):
+    if dirExists(lockPath):
+      removeDir(lockPath)
+    acquired = tryAcquireRepoLock(lockPath)
+
+  if not acquired:
+    let normalizedRepoPath = normalizeAbsolutePath(repoPath)
+    raise newException(IOError, &"another planner/manager is active for {normalizedRepoPath}")
+
+  let pidPath = lockPath / ManagedRepoLockPidFileName
+  let currentPid = getCurrentProcessId()
+  writeFile(pidPath, &"{currentPid}\n")
+  defer:
+    if fileExists(pidPath):
+      removeFile(pidPath)
+    if dirExists(lockPath):
+      removeDir(lockPath)
+
+  result = operation()
+
+proc recoverManagedWorktreeConflict(repoPath: string, addOutput: string): bool =
+  ## Remove stale managed worktree conflicts and prune stale worktree metadata.
   let conflictPath = parseWorktreeConflictPath(addOutput)
   if conflictPath.len == 0:
     result = false
-  elif not isManagedPlanTempWorktreePath(conflictPath):
+  elif not isManagedWorktreePath(repoPath, conflictPath):
     result = false
   else:
     discard gitCheck(repoPath, "worktree", "remove", "--force", conflictPath)
     discard gitCheck(repoPath, "worktree", "prune")
+    if dirExists(conflictPath):
+      removeDir(conflictPath)
     result = true
 
-proc withPlanWorktree[T](repoPath: string, operation: proc(planPath: string): T): T =
-  ## Open a temporary worktree for the plan branch, run operation, then remove it.
-  if gitCheck(repoPath, "rev-parse", "--verify", PlanBranch) != 0:
-    raise newException(ValueError, "scriptorium/plan branch does not exist")
+proc addWorktreeWithRecovery(repoPath: string, worktreePath: string, branch: string) =
+  ## Add one git worktree path for one branch, recovering stale managed conflicts once.
+  createDir(parentDir(worktreePath))
+  if dirExists(worktreePath):
+    removeDir(worktreePath)
 
-  let planWorktree = createTempDir(PlanTempWorktreePrefix, "", getTempDir())
-  removeDir(planWorktree)
   var recoveredConflict = false
   while true:
     let addProcess = startProcess(
       "git",
-      args = @["-C", repoPath, "worktree", "add", planWorktree, PlanBranch],
+      args = @["-C", repoPath, "worktree", "add", worktreePath, branch],
       options = {poUsePath, poStdErrToStdOut},
     )
     let addOutput = addProcess.outputStream.readAll()
@@ -193,19 +310,33 @@ proc withPlanWorktree[T](repoPath: string, operation: proc(planPath: string): T)
     if addRc == 0:
       break
 
-    if recoveredConflict or not recoverManagedPlanWorktreeConflict(repoPath, addOutput):
+    if recoveredConflict or not recoverManagedWorktreeConflict(repoPath, addOutput):
+      let addOutputText = addOutput.strip()
       raise newException(
         IOError,
-        fmt"git worktree add {planWorktree} {PlanBranch} failed: {addOutput.strip()}",
+        &"git worktree add {worktreePath} {branch} failed: {addOutputText}",
       )
     recoveredConflict = true
-    if dirExists(planWorktree):
-      removeDir(planWorktree)
+    if dirExists(worktreePath):
+      removeDir(worktreePath)
 
+proc withPlanWorktree[T](repoPath: string, operation: proc(planPath: string): T): T =
+  ## Open a deterministic /tmp worktree for the plan branch, then remove it.
+  if gitCheck(repoPath, "rev-parse", "--verify", PlanBranch) != 0:
+    raise newException(ValueError, "scriptorium/plan branch does not exist")
+
+  let planWorktree = managedPlanWorktreePath(repoPath)
+  addWorktreeWithRecovery(repoPath, planWorktree, PlanBranch)
   defer:
     discard gitCheck(repoPath, "worktree", "remove", "--force", planWorktree)
 
   result = operation(planWorktree)
+
+proc withLockedPlanWorktree[T](repoPath: string, operation: proc(planPath: string): T): T =
+  ## Acquire the per-repo lock, then open a deterministic plan worktree and remove it.
+  result = withRepoLock(repoPath, proc(): T =
+    withPlanWorktree(repoPath, operation)
+  )
 
 proc loadSpecFromPlanPath(planPath: string): string =
   ## Load spec.md from an existing plan branch worktree path.
@@ -737,7 +868,7 @@ proc runCommandCapture(workingDir: string, command: string, args: seq[string]): 
   result = (exitCode: exitCode, output: output)
 
 proc withMasterWorktree[T](repoPath: string, operation: proc(masterPath: string): T): T =
-  ## Open a temporary worktree for the master branch, run operation, then remove it.
+  ## Open a deterministic /tmp worktree for master when needed, then remove it.
   if gitCheck(repoPath, "rev-parse", "--verify", "master") != 0:
     raise newException(ValueError, "master branch does not exist")
 
@@ -752,9 +883,8 @@ proc withMasterWorktree[T](repoPath: string, operation: proc(masterPath: string)
     elif line == "branch refs/heads/master" and currentPath.len > 0:
       return operation(currentPath)
 
-  let masterWorktree = createTempDir("scriptorium_master_", "", getTempDir())
-  removeDir(masterWorktree)
-  gitRun(repoPath, "worktree", "add", masterWorktree, "master")
+  let masterWorktree = managedMasterWorktreePath(repoPath)
+  addWorktreeWithRecovery(repoPath, masterWorktree, "master")
   defer:
     discard gitCheck(repoPath, "worktree", "remove", "--force", masterWorktree)
 
@@ -998,13 +1128,17 @@ proc branchNameForTicket(ticketRelPath: string): string =
 proc worktreePathForTicket(repoPath: string, ticketRelPath: string): string =
   ## Build a deterministic absolute worktree path for a ticket.
   let ticketName = splitFile(ticketRelPath).name
-  let root = repoPath / ManagedWorktreeRoot
+  let root = managedTicketWorktreeRootPath(repoPath)
   result = absolutePath(root / ticketName)
+
+proc cleanupLegacyManagedTicketWorktrees(repoPath: string): seq[string]
+  ## Remove legacy repo-local managed ticket worktrees from older versions.
 
 proc ensureWorktreeCreated(repoPath: string, ticketRelPath: string): tuple[branch: string, path: string] =
   ## Ensure the code worktree exists for the ticket and return branch/path.
   let branch = branchNameForTicket(ticketRelPath)
   let path = worktreePathForTicket(repoPath, ticketRelPath)
+  discard cleanupLegacyManagedTicketWorktrees(repoPath)
   createDir(parentDir(path))
 
   discard gitCheck(repoPath, "worktree", "remove", "--force", path)
@@ -1031,6 +1165,20 @@ proc listGitWorktreePaths(repoPath: string): seq[string] =
   for line in output.splitLines():
     if line.startsWith("worktree "):
       result.add(line["worktree ".len..^1].strip())
+
+proc cleanupLegacyManagedTicketWorktrees(repoPath: string): seq[string] =
+  ## Remove legacy repo-local managed ticket worktrees from older versions.
+  let legacyRoot = normalizeAbsolutePath(repoPath / LegacyManagedWorktreeRoot)
+  for path in listGitWorktreePaths(repoPath):
+    let normalizedPath = normalizeAbsolutePath(path)
+    if normalizedPath.startsWith(legacyRoot & "/"):
+      discard gitCheck(repoPath, "worktree", "remove", "--force", path)
+      if dirExists(path):
+        removeDir(path)
+      result.add(path)
+
+  if dirExists(legacyRoot):
+    removeDir(legacyRoot)
 
 proc writeAreasAndCommit(planPath: string, docs: seq[AreaDocument]): bool =
   ## Write generated area files and commit only when contents changed.
@@ -1236,7 +1384,7 @@ proc syncAreasFromSpec*(repoPath: string, generateAreas: ArchitectAreaGenerator)
     raise newException(ValueError, "architect area generator is required")
 
   let cfg = loadConfig(repoPath)
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     let missing = areasMissingInPlanPath(planPath)
     if missing:
       let spec = loadSpecFromPlanPath(planPath)
@@ -1253,7 +1401,7 @@ proc runArchitectAreas*(repoPath: string, runner: AgentRunner = runAgent): bool 
     raise newException(ValueError, "agent runner is required")
 
   let cfg = loadConfig(repoPath)
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     if not hasRunnableSpecInPlanPath(planPath):
       false
     elif not areasMissingInPlanPath(planPath):
@@ -1291,7 +1439,7 @@ proc updateSpecFromArchitect*(
     raise newException(ValueError, "plan prompt is required")
 
   let cfg = loadConfig(repoPath)
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     let existingSpec = loadSpecFromPlanPath(planPath)
     discard runPlanArchitectRequest(
       runner,
@@ -1323,7 +1471,7 @@ proc syncTicketsFromAreas*(repoPath: string, generateTickets: ManagerTicketGener
     raise newException(ValueError, "manager ticket generator is required")
 
   let cfg = loadConfig(repoPath)
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     let areasToProcess = areasNeedingTicketsInPlanPath(planPath)
     if areasToProcess.len == 0:
       false
@@ -1350,7 +1498,7 @@ proc runManagerTickets*(repoPath: string, runner: AgentRunner = runAgent): bool 
 
   let cfg = loadConfig(repoPath)
   let repoDirtyStateBefore = snapshotDirtyStateInGitPath(repoPath)
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     if not hasRunnableSpecInPlanPath(planPath):
       false
     else:
@@ -1385,7 +1533,7 @@ proc runManagerTickets*(repoPath: string, runner: AgentRunner = runAgent): bool 
 
 proc assignOldestOpenTicket*(repoPath: string): TicketAssignment =
   ## Move the oldest open ticket to in-progress and attach a code worktree.
-  result = withPlanWorktree(repoPath, proc(planPath: string): TicketAssignment =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): TicketAssignment =
     let openTicket = oldestOpenTicketInPlanPath(planPath)
     if openTicket.len == 0:
       return TicketAssignment()
@@ -1414,8 +1562,11 @@ proc assignOldestOpenTicket*(repoPath: string): TicketAssignment =
 
 proc cleanupStaleTicketWorktrees*(repoPath: string): seq[string] =
   ## Remove managed code worktrees that no longer correspond to in-progress tickets.
-  let managedRoot = absolutePath(repoPath / ManagedWorktreeRoot)
-  let activeWorktrees = withPlanWorktree(repoPath, proc(planPath: string): HashSet[string] =
+  let managedRoot = normalizeAbsolutePath(managedTicketWorktreeRootPath(repoPath))
+  for path in cleanupLegacyManagedTicketWorktrees(repoPath):
+    result.add(path)
+
+  let activeWorktrees = withLockedPlanWorktree(repoPath, proc(planPath: string): HashSet[string] =
     result = initHashSet[string]()
     for ticketPath in listMarkdownFiles(planPath / PlanTicketsInProgressDir):
       let worktreePath = parseWorktreeFromTicketContent(readFile(ticketPath))
@@ -1424,7 +1575,8 @@ proc cleanupStaleTicketWorktrees*(repoPath: string): seq[string] =
   )
 
   for path in listGitWorktreePaths(repoPath):
-    if path.startsWith(managedRoot) and not activeWorktrees.contains(path):
+    let normalizedPath = normalizeAbsolutePath(path)
+    if normalizedPath.startsWith(managedRoot & "/") and not activeWorktrees.contains(path):
       discard gitCheck(repoPath, "worktree", "remove", "--force", path)
       if dirExists(path):
         removeDir(path)
@@ -1432,7 +1584,7 @@ proc cleanupStaleTicketWorktrees*(repoPath: string): seq[string] =
 
 proc ensureMergeQueueInitialized*(repoPath: string): bool =
   ## Ensure the merge queue structure exists on the plan branch.
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     let changed = ensureMergeQueueInitializedInPlanPath(planPath)
     if changed:
       gitRun(planPath, "add", PlanMergeQueueDir)
@@ -1456,7 +1608,7 @@ proc enqueueMergeRequest*(
   if summary.strip().len == 0:
     raise newException(ValueError, "merge summary is required")
 
-  result = withPlanWorktree(repoPath, proc(planPath: string): string =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): string =
     discard ensureMergeQueueInitializedInPlanPath(planPath)
 
     let queueId = nextMergeQueueId(planPath)
@@ -1480,7 +1632,7 @@ proc enqueueMergeRequest*(
 
 proc processMergeQueue*(repoPath: string): bool =
   ## Process at most one merge queue item and apply success/failure transitions.
-  result = withPlanWorktree(repoPath, proc(planPath: string): bool =
+  result = withLockedPlanWorktree(repoPath, proc(planPath: string): bool =
     discard ensureMergeQueueInitializedInPlanPath(planPath)
     let activePath = planPath / PlanMergeQueueActivePath
 
@@ -1586,7 +1738,7 @@ proc executeAssignedTicket*(
   let agentResult = runner(request)
   result = agentResult
 
-  discard withPlanWorktree(repoPath, proc(planPath: string): int =
+  discard withLockedPlanWorktree(repoPath, proc(planPath: string): int =
     let ticketPath = planPath / ticketRelPath
     if not fileExists(ticketPath):
       raise newException(ValueError, fmt"ticket does not exist in plan branch: {ticketRelPath}")
@@ -1782,7 +1934,7 @@ proc runInteractivePlanSession*(
     interactivePlanInterrupted = false
 
   let cfg = loadConfig(repoPath)
-  discard withPlanWorktree(repoPath, proc(planPath: string): int =
+  discard withLockedPlanWorktree(repoPath, proc(planPath: string): int =
     if not quiet:
       echo "scriptorium: interactive planning session (type /help for commands, /quit to exit)"
     var history: seq[PlanTurn] = @[]
