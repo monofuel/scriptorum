@@ -1,11 +1,14 @@
 import
   std/[monotimes, os, osproc, posix, streams, strformat, strutils, times],
-  jsony
+  jsony,
+  ./prompt_catalog
 
 const
   DefaultCodexBinary = "codex"
   DefaultCodexDeveloperInstructions = "developer_instructions=\"\""
   DefaultCodexMcpServers = "mcp_servers={}"
+  Gpt51CodexMiniModel = "gpt-5.1-codex-mini"
+  Gpt51CodexMiniDefaultReasoningEffort = "high"
   DefaultTicketId = "adhoc"
   DefaultAttempt = 1
   DefaultLogRoot = ".scriptorium/logs"
@@ -41,6 +44,7 @@ type
     prompt*: string
     workingDir*: string
     model*: string
+    reasoningEffort*: string
     ticketId*: string
     attempt*: int
     codexBinary*: string
@@ -151,6 +155,25 @@ proc resolveHeartbeatIntervalMs(request: CodexRunRequest): int =
   else:
     result = DefaultHeartbeatIntervalMs
 
+proc normalizeReasoningEffort(value: string): string =
+  ## Normalize one reasoning effort string to a supported codex value.
+  let clean = value.strip().toLowerAscii()
+  if clean.len == 0:
+    return ""
+  case clean
+  of "low", "medium", "high", "xhigh":
+    result = clean
+  else:
+    raise newException(ValueError, &"unsupported reasoning effort: {clean}")
+
+proc resolveReasoningEffort(request: CodexRunRequest): string =
+  ## Resolve the codex reasoning effort override for this request.
+  result = normalizeReasoningEffort(request.reasoningEffort)
+  let model = request.model.strip().toLowerAscii()
+  if model == Gpt51CodexMiniModel:
+    if result.len == 0 or result == "xhigh":
+      result = Gpt51CodexMiniDefaultReasoningEffort
+
 proc elapsedMs(since: MonoTime): int64 =
   ## Return elapsed milliseconds from since until now.
   result = (getMonoTime() - since).inMilliseconds
@@ -218,6 +241,11 @@ proc buildCodexExecArgs*(request: CodexRunRequest, lastMessagePath: string): seq
     "--dangerously-bypass-approvals-and-sandbox",
   ]
 
+  let reasoningEffort = resolveReasoningEffort(request)
+  if reasoningEffort.len > 0:
+    result.add("-c")
+    result.add(&"model_reasoning_effort=\"{reasoningEffort}\"")
+
   if request.skipGitRepoCheck:
     result.add("--skip-git-repo-check")
 
@@ -234,13 +262,19 @@ proc buildContinuationPrompt(
   let continuationText = if customContinuationPrompt.len > 0:
       customContinuationPrompt.strip()
     else:
-      "Continue from the previous attempt and complete the ticket."
+      CodexRetryDefaultContinuationText.strip()
 
-  result = originalPrompt.strip() & "\n\n" &
-    &"Attempt {previousResult.attempt} failed with exit code {previousResult.exitCode} (timeout: {previousResult.timeoutKind}).\n" &
-    "Last output excerpt:\n" &
-    summaryTail & "\n\n" &
-    continuationText & "\n"
+  let retryPrompt = renderPromptTemplate(
+    CodexRetryContinuationTemplate,
+    [
+      (name: "ATTEMPT", value: $previousResult.attempt),
+      (name: "EXIT_CODE", value: $previousResult.exitCode),
+      (name: "TIMEOUT_KIND", value: $previousResult.timeoutKind),
+      (name: "SUMMARY_TAIL", value: summaryTail),
+      (name: "CONTINUATION_TEXT", value: continuationText),
+    ],
+  )
+  result = originalPrompt.strip() & "\n\n" & retryPrompt
 
 proc firstNonEmpty(values: varargs[string]): string =
   ## Return the first non-empty trimmed value from values.
@@ -471,6 +505,7 @@ proc runCodexAttempt(request: CodexRunRequest, prompt: string, attemptValue: int
     CodexRunRequest(
       workingDir: request.workingDir,
       model: request.model,
+      reasoningEffort: request.reasoningEffort,
       skipGitRepoCheck: request.skipGitRepoCheck,
     ),
     lastMessagePath,

@@ -53,9 +53,70 @@ suite "harness codex":
       "--model",
       "gpt-5.1-codex-mini",
       "--dangerously-bypass-approvals-and-sandbox",
+      "-c",
+      "model_reasoning_effort=\"high\"",
       "--skip-git-repo-check",
       "-",
     ]
+
+  test "buildCodexExecArgs sets mini reasoning effort to high by default":
+    let request = CodexRunRequest(
+      workingDir: "/tmp/worktree",
+      model: "gpt-5.1-codex-mini",
+    )
+
+    let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
+    check "model_reasoning_effort=\"high\"" in args
+
+  test "buildCodexExecArgs includes reasoning effort override when configured":
+    let request = CodexRunRequest(
+      workingDir: "/tmp/worktree",
+      model: "gpt-5.1-codex-mini",
+      reasoningEffort: "high",
+    )
+
+    let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
+    check "-c" in args
+    check "model_reasoning_effort=\"high\"" in args
+
+  test "buildCodexExecArgs keeps xhigh for non-mini models":
+    let request = CodexRunRequest(
+      workingDir: "/tmp/worktree",
+      model: "gpt-5.3-codex",
+      reasoningEffort: "xhigh",
+    )
+
+    let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
+    check "model_reasoning_effort=\"xhigh\"" in args
+
+  test "buildCodexExecArgs maps mini xhigh to high":
+    let request = CodexRunRequest(
+      workingDir: "/tmp/worktree",
+      model: "gpt-5.1-codex-mini",
+      reasoningEffort: "xhigh",
+    )
+
+    let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
+    check "model_reasoning_effort=\"high\"" in args
+
+  test "buildCodexExecArgs leaves reasoning unset for non-mini models":
+    let request = CodexRunRequest(
+      workingDir: "/tmp/worktree",
+      model: "gpt-5.3-codex",
+    )
+
+    let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
+    check "model_reasoning_effort=\"high\"" notin args
+
+  test "buildCodexExecArgs rejects unsupported reasoning effort values":
+    let request = CodexRunRequest(
+      workingDir: "/tmp/worktree",
+      model: "gpt-5.1-codex-mini",
+      reasoningEffort: "maximum",
+    )
+
+    expect ValueError:
+      discard buildCodexExecArgs(request, "/tmp/last-message.txt")
 
   test "runCodex captures output log and last message":
     withTempHarnessDir(proc(tmpDir: string) =

@@ -6,6 +6,8 @@ const
   ConfigFile = "scriptorium.json"
   DefaultArchitectModel = "codex-fake-unit-test-model"
   DefaultCodingModel = "codex-fake-unit-test-model"
+  DefaultArchitectReasoningEffort = ""
+  DefaultCodingReasoningEffort = ""
 
 type
   Harness* = enum
@@ -17,11 +19,16 @@ type
     architect*: string
     coding*: string
 
+  ReasoningEffort* = object
+    architect*: string
+    coding*: string
+
   Endpoints* = object
     local*: string
 
   Config* = object
     models*: Models
+    reasoningEffort*: ReasoningEffort
     endpoints*: Endpoints
 
 proc defaultConfig*(): Config =
@@ -30,6 +37,10 @@ proc defaultConfig*(): Config =
     models: Models(
       architect: DefaultArchitectModel,
       coding: DefaultCodingModel,
+    ),
+    reasoningEffort: ReasoningEffort(
+      architect: DefaultArchitectReasoningEffort,
+      coding: DefaultCodingReasoningEffort,
     ),
     endpoints: Endpoints(
       local: "",
@@ -57,5 +68,9 @@ proc loadConfig*(repoPath: string): Config =
     result.models.architect = parsed.models.architect
   if parsed.models.coding.len > 0:
     result.models.coding = parsed.models.coding
+  if parsed.reasoningEffort.architect.len > 0:
+    result.reasoningEffort.architect = parsed.reasoningEffort.architect
+  if parsed.reasoningEffort.coding.len > 0:
+    result.reasoningEffort.coding = parsed.reasoningEffort.coding
   if parsed.endpoints.local.len > 0:
     result.endpoints.local = parsed.endpoints.local

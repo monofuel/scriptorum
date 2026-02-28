@@ -21,6 +21,7 @@ type
     prompt*: string
     workingDir*: string
     model*: string
+    reasoningEffort*: string
     ticketId*: string
     attempt*: int
     codexBinary*: string
@@ -79,6 +80,7 @@ proc runAgent*(request: AgentRunRequest): AgentRunResult =
       prompt: request.prompt,
       workingDir: request.workingDir,
       model: request.model,
+      reasoningEffort: request.reasoningEffort,
       ticketId: request.ticketId,
       attempt: request.attempt,
       codexBinary: request.codexBinary,

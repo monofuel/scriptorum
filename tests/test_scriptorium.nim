@@ -185,16 +185,23 @@ suite "config":
     let cfg = defaultConfig()
     check cfg.models.architect == "codex-fake-unit-test-model"
     check cfg.models.coding == "codex-fake-unit-test-model"
+    check cfg.reasoningEffort.architect == ""
+    check cfg.reasoningEffort.coding == ""
 
   test "loads from scriptorium.json":
     let tmp = getTempDir() / "scriptorium_test_config"
     createDir(tmp)
     defer: removeDir(tmp)
-    writeFile(tmp / "scriptorium.json", """{"models":{"architect":"claude-opus-4-6","coding":"grok-code-fast-1"},"endpoints":{"local":"http://localhost:1234/v1"}}""")
+    writeFile(
+      tmp / "scriptorium.json",
+      """{"models":{"architect":"claude-opus-4-6","coding":"grok-code-fast-1"},"reasoning_effort":{"architect":"medium","coding":"high"},"endpoints":{"local":"http://localhost:1234/v1"}}""",
+    )
 
     let cfg = loadConfig(tmp)
     check cfg.models.architect == "claude-opus-4-6"
     check cfg.models.coding == "grok-code-fast-1"
+    check cfg.reasoningEffort.architect == "medium"
+    check cfg.reasoningEffort.coding == "high"
     check cfg.endpoints.local == "http://localhost:1234/v1"
 
   test "missing file returns defaults":
@@ -205,6 +212,8 @@ suite "config":
     let cfg = loadConfig(tmp)
     check cfg.models.architect == "codex-fake-unit-test-model"
     check cfg.models.coding == "codex-fake-unit-test-model"
+    check cfg.reasoningEffort.architect == ""
+    check cfg.reasoningEffort.coding == ""
 
   test "harness routing":
     check harness("claude-opus-4-6") == harnessClaudeCode
@@ -297,9 +306,11 @@ suite "orchestrator plan spec update":
     writeFile(tmp / "source-marker.txt", "alpha\n")
     runCmdOrDie("git -C " & quoteShell(tmp) & " add source-marker.txt")
     runCmdOrDie("git -C " & quoteShell(tmp) & " commit -m test-add-source-marker")
+    writeFile(tmp / "scriptorium.json", """{"reasoning_effort":{"architect":"high"}}""")
 
     var callCount = 0
     var capturedFirstModel = ""
+    var capturedFirstReasoningEffort = ""
     var capturedFirstWorkingDir = ""
     var capturedFirstRepoPath = ""
     var capturedFirstSpec = ""
@@ -322,6 +333,7 @@ suite "orchestrator plan spec update":
 
       if callCount == 1:
         capturedFirstModel = req.model
+        capturedFirstReasoningEffort = req.reasoningEffort
         capturedFirstWorkingDir = req.workingDir
         capturedFirstRepoPath = repoPathFromPrompt
         capturedFirstSpec = priorSpec
@@ -348,6 +360,7 @@ suite "orchestrator plan spec update":
     check not unchanged
     check callCount == 2
     check capturedFirstModel == "codex-fake-unit-test-model"
+    check capturedFirstReasoningEffort == "high"
     check capturedFirstWorkingDir != tmp
     check capturedFirstRepoPath == tmp
     check "Run `scriptorium plan`" in capturedFirstSpec
@@ -787,6 +800,7 @@ suite "orchestrator coding agent execution":
     defer: removeDir(tmp)
     runInit(tmp, quiet = true)
     addTicketToPlan(tmp, "open", "0001-first.md", "# Ticket 1\n\n**Area:** a\n")
+    writeFile(tmp / "scriptorium.json", """{"reasoning_effort":{"coding":"high"}}""")
 
     let assignment = assignOldestOpenTicket(tmp)
     let before = planCommitCount(tmp)
@@ -815,6 +829,7 @@ suite "orchestrator coding agent execution":
 
     check callCount == 1
     check capturedRequest.model == "codex-fake-unit-test-model"
+    check capturedRequest.reasoningEffort == "high"
     check capturedRequest.workingDir == assignment.worktree
     check capturedRequest.ticketId == "0001"
     check "Ticket 1" in capturedRequest.prompt
@@ -1009,6 +1024,7 @@ suite "orchestrator final v1 flow":
     defer: removeDir(tmp)
     runInit(tmp, quiet = true)
     writeSpecInPlan(tmp, "# Spec\n\nBuild area files.\n")
+    writeFile(tmp / "scriptorium.json", """{"reasoning_effort":{"architect":"high"}}""")
 
     var callCount = 0
     var capturedRequest = AgentRunRequest()
@@ -1035,6 +1051,7 @@ suite "orchestrator final v1 flow":
     check callCount == 1
     check capturedRequest.ticketId == "architect-areas"
     check capturedRequest.model == "codex-fake-unit-test-model"
+    check capturedRequest.reasoningEffort == "high"
     check "areas/01-arch.md" in files
     check after == before + 1
 
@@ -1045,6 +1062,7 @@ suite "orchestrator final v1 flow":
     runInit(tmp, quiet = true)
     writeSpecInPlan(tmp, "# Spec\n\nCreate tickets from areas.\n")
     addAreaToPlan(tmp, "01-core.md", "# Area 01\n\n## Scope\n- Core\n")
+    writeFile(tmp / "scriptorium.json", """{"reasoning_effort":{"coding":"high"}}""")
 
     var callCount = 0
     var capturedRequest = AgentRunRequest()
@@ -1074,6 +1092,7 @@ suite "orchestrator final v1 flow":
     check callCount == 1
     check capturedRequest.ticketId == "manager-01-core"
     check capturedRequest.model == "codex-fake-unit-test-model"
+    check capturedRequest.reasoningEffort == "high"
     check "tickets/open/0001-core-task.md" in files
     check after == before + 1
 

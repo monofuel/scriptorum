@@ -1,7 +1,7 @@
 import
   std/[algorithm, os, osproc, posix, sets, streams, strformat, strutils, tables, tempfiles, uri],
   mcport,
-  ./[agent_runner, config]
+  ./[agent_runner, config, prompt_catalog]
 
 const
   PlanBranch = "scriptorium/plan"
@@ -338,38 +338,37 @@ proc formatPlanStreamEvent(event: AgentStreamEvent): string =
 
 proc buildCodingAgentPrompt(ticketRelPath: string, ticketContent: string): string =
   ## Build the coding-agent prompt from ticket context.
-  result =
-    "You are the coding agent for this ticket.\n" &
-    "Implement the requested work and keep changes minimal and safe.\n\n" &
-    "Ticket path:\n" &
-    ticketRelPath & "\n\n" &
-    "Ticket content:\n" &
-    ticketContent.strip() & "\n"
+  result = renderPromptTemplate(
+    CodingAgentTemplate,
+    [
+      (name: "TICKET_PATH", value: ticketRelPath),
+      (name: "TICKET_CONTENT", value: ticketContent.strip()),
+    ],
+  )
 
 proc buildArchitectAreasPrompt(spec: string): string =
   ## Build the architect prompt that writes area files directly into areas/.
-  result =
-    "You are the Architect for scriptorium.\n" &
-    "Read spec.md and write/update area markdown files directly under areas/.\n" &
-    "Use file tools to create only areas/*.md files.\n" &
-    "Do not edit tickets/, queue/, or spec.md in this task.\n\n" &
-    "Current spec.md:\n" &
-    spec.strip() & "\n"
+  result = renderPromptTemplate(
+    ArchitectAreasTemplate,
+    [
+      (name: "CURRENT_SPEC", value: spec.strip()),
+    ],
+  )
 
 proc buildManagerTicketsPrompt(areaRelPath: string, areaContent: string, nextId: int): string =
   ## Build the manager prompt that writes ticket files directly into tickets/open/.
   let areaId = areaIdFromAreaPath(areaRelPath)
-  result =
-    "You are the Manager for scriptorium.\n" &
-    "Create ticket markdown files directly under tickets/open/.\n" &
-    "Each ticket filename must start with a zero-padded numeric ID, then a slug.\n" &
-    fmt"Start IDs at {nextId:04d} and increase monotonically for additional tickets.\n" &
-    fmt"Each ticket must include the line `{AreaFieldPrefix} {areaId}`.\n" &
-    "Do not edit areas/, queue/, or spec.md in this task.\n\n" &
-    "Area file:\n" &
-    areaRelPath & "\n\n" &
-    "Area content:\n" &
-    areaContent.strip() & "\n"
+  let nextIdText = &"{nextId:04d}"
+  result = renderPromptTemplate(
+    ManagerTicketsTemplate,
+    [
+      (name: "NEXT_ID", value: nextIdText),
+      (name: "AREA_FIELD_PREFIX", value: AreaFieldPrefix),
+      (name: "AREA_ID", value: areaId),
+      (name: "AREA_PATH", value: areaRelPath),
+      (name: "AREA_CONTENT", value: areaContent.strip()),
+    ],
+  )
 
 proc formatAgentRunNote(model: string, runResult: AgentRunResult): string =
   ## Format a markdown note summarizing one coding-agent run.
@@ -410,31 +409,29 @@ proc branchNameForTicket(ticketRelPath: string): string
 
 proc buildPlanScopePrompt(repoPath: string): string =
   ## Build shared planning prompt context with read and write scope.
-  result =
-    "Repository root path (read project source files from here):\n" &
-    repoPath & "\n\n" &
-    "You are running in the scriptorium plan worktree.\n" &
-    "Only edit spec.md in this working directory.\n" &
-    "Do not edit any other files.\n"
+  result = renderPromptTemplate(
+    PlanScopeTemplate,
+    [
+      (name: "REPO_PATH", value: repoPath),
+    ],
+  )
 
 proc buildArchitectPlanPrompt(repoPath: string, userPrompt: string, currentSpec: string): string =
   ## Build the one-shot architect prompt that edits spec.md in place.
-  result =
-    "You are the Architect for scriptorium.\n" &
-    buildPlanScopePrompt(repoPath) & "\n" &
-    "Act as the planning liaison for the engineer.\n" &
-    "If the request is discussion, analysis, or questions, reply directly and do not edit spec.md.\n" &
-    "Only edit spec.md when the engineer is asking to change plan content.\n" &
-    "When editing is needed, use file tools to edit spec.md directly.\n\n" &
-    "User request:\n" &
-    userPrompt.strip() & "\n\n" &
-    "Current spec.md:\n" &
-    currentSpec.strip() & "\n"
+  result = renderPromptTemplate(
+    ArchitectPlanOneShotTemplate,
+    [
+      (name: "PLAN_SCOPE", value: buildPlanScopePrompt(repoPath).strip()),
+      (name: "USER_REQUEST", value: userPrompt.strip()),
+      (name: "CURRENT_SPEC", value: currentSpec.strip()),
+    ],
+  )
 
 proc runPlanArchitectRequest(
   runner: AgentRunner,
   planPath: string,
   model: string,
+  reasoningEffort: string,
   prompt: string,
   ticketId: string,
   onEvent: AgentEventHandler = nil,
@@ -447,6 +444,7 @@ proc runPlanArchitectRequest(
     prompt: prompt,
     workingDir: planPath,
     model: model,
+    reasoningEffort: reasoningEffort,
     ticketId: ticketId,
     attempt: DefaultAgentAttempt,
     skipGitRepoCheck: true,
@@ -1176,6 +1174,7 @@ proc runArchitectAreas*(repoPath: string, runner: AgentRunner = runAgent): bool 
         prompt: buildArchitectAreasPrompt(spec),
         workingDir: planPath,
         model: cfg.models.architect,
+        reasoningEffort: cfg.reasoningEffort.architect,
         ticketId: ArchitectAreasTicketId,
         attempt: DefaultAgentAttempt,
         skipGitRepoCheck: true,
@@ -1208,6 +1207,7 @@ proc updateSpecFromArchitect*(
       runner,
       planPath,
       cfg.models.architect,
+      cfg.reasoningEffort.architect,
       buildArchitectPlanPrompt(repoPath, prompt, existingSpec),
       PlanSpecTicketId,
     )
@@ -1275,6 +1275,7 @@ proc runManagerTickets*(repoPath: string, runner: AgentRunner = runAgent): bool 
             prompt: buildManagerTicketsPrompt(areaRelPath, areaContent, nextId),
             workingDir: planPath,
             model: cfg.models.coding,
+            reasoningEffort: cfg.reasoningEffort.coding,
             ticketId: ManagerTicketIdPrefix & areaId,
             attempt: DefaultAgentAttempt,
             skipGitRepoCheck: true,
@@ -1483,6 +1484,7 @@ proc executeAssignedTicket*(
     prompt: buildCodingAgentPrompt(ticketRelPath, ticketContent),
     workingDir: assignment.worktree,
     model: cfg.models.coding,
+    reasoningEffort: cfg.reasoningEffort.coding,
     ticketId: ticketIdFromTicketPath(ticketRelPath),
     attempt: DefaultAgentAttempt,
     skipGitRepoCheck: true,
@@ -1636,22 +1638,21 @@ proc runOrchestratorForTicks*(repoPath: string, maxTicks: int, runner: AgentRunn
 
 proc buildInteractivePlanPrompt*(repoPath: string, spec: string, history: seq[PlanTurn], userMsg: string): string =
   ## Assemble the multi-turn architect prompt with spec, history, and current message.
-  result =
-    "You are the Architect for scriptorium.\n" &
-    buildPlanScopePrompt(repoPath) & "\n" &
-    "Act as the planning liaison for the engineer.\n" &
-    "If the engineer is discussing or asking questions, reply directly and do not edit spec.md.\n" &
-    "Only edit spec.md when the engineer asks to change plan content.\n" &
-    "When editing is needed, you may edit spec.md directly using your file tools.\n\n" &
-    "Current spec.md:\n" &
-    spec.strip() & "\n"
-
+  var conversationHistory = ""
   if history.len > 0:
-    result &= "\nConversation history:\n"
+    conversationHistory = "\nConversation history:\n"
     for turn in history:
-      result &= fmt"\n[{turn.role}]: {turn.text.strip()}\n"
+      conversationHistory &= fmt"\n[{turn.role}]: {turn.text.strip()}\n"
 
-  result &= fmt"\n[engineer]: {userMsg.strip()}\n"
+  result = renderPromptTemplate(
+    ArchitectPlanInteractiveTemplate,
+    [
+      (name: "PLAN_SCOPE", value: buildPlanScopePrompt(repoPath).strip()),
+      (name: "CURRENT_SPEC", value: spec.strip()),
+      (name: "CONVERSATION_HISTORY", value: conversationHistory),
+      (name: "USER_MESSAGE", value: userMsg.strip()),
+    ],
+  )
 
 proc runInteractivePlanSession*(
   repoPath: string,
@@ -1746,6 +1747,7 @@ proc runInteractivePlanSession*(
         runner,
         planPath,
         cfg.models.architect,
+        cfg.reasoningEffort.architect,
         prompt,
         PlanSessionTicketId,
         streamEventHandler,
