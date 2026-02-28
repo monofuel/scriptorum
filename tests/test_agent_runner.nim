@@ -58,7 +58,9 @@ printf 'done\n' > "$last_message"
       check result.timeoutKind == "none"
       check result.lastMessage.contains("done")
       check "model_reasoning_effort=\"high\"" in result.command
-      check "mcp_servers={scriptorium={type=\"http\",url=\"http://127.0.0.1:8097/mcp\"}}" in result.command
+      check "mcp_servers.scriptorium.url=\"http://127.0.0.1:8097/mcp\"" in result.command
+      check "mcp_servers.scriptorium.enabled=true" in result.command
+      check "mcp_servers.scriptorium.required=true" in result.command
       check streamedEvents.len > 0
       check streamedEvents[0].contains("message:ok")
     )

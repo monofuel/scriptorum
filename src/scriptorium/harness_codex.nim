@@ -6,7 +6,6 @@ import
 const
   DefaultCodexBinary = "codex"
   DefaultCodexDeveloperInstructions = "developer_instructions=\"\""
-  DefaultCodexMcpServers = "mcp_servers={}"
   Gpt51CodexMiniModel = "gpt-5.1-codex-mini"
   Gpt51CodexMiniDefaultReasoningEffort = "high"
   DefaultTicketId = "adhoc"
@@ -217,22 +216,25 @@ proc readOutputChunk(fd: cint): tuple[data: string, eof: bool] =
       result = (buffer, false)
     break
 
-proc buildMcpServersConfig(request: CodexRunRequest): string =
-  ## Build the codex mcp_servers config value for one run request.
+proc buildMcpServersArgs(request: CodexRunRequest): seq[string] =
+  ## Build codex -c args for MCP server configuration using separate dot-notation keys.
   let cleanEndpoint = request.mcpEndpoint.strip()
   if cleanEndpoint.len == 0:
-    result = DefaultCodexMcpServers
-  else:
-    var endpointBase = cleanEndpoint
-    while endpointBase.endsWith("/"):
-      endpointBase.setLen(endpointBase.len - 1)
+    return @[]
 
-    if endpointBase.len == 0:
-      result = DefaultCodexMcpServers
-    else:
-      let mcpUrl = endpointBase & "/mcp"
-      let escapedMcpUrl = mcpUrl.replace("\\", "\\\\").replace("\"", "\\\"")
-      result = &"mcp_servers={{scriptorium={{type=\"http\",url=\"{escapedMcpUrl}\"}}}}"
+  var endpointBase = cleanEndpoint
+  while endpointBase.endsWith("/"):
+    endpointBase.setLen(endpointBase.len - 1)
+
+  if endpointBase.len == 0:
+    return @[]
+
+  let mcpUrl = endpointBase & "/mcp"
+  result = @[
+    "-c", &"mcp_servers.scriptorium.url=\"{mcpUrl}\"",
+    "-c", "mcp_servers.scriptorium.enabled=true",
+    "-c", "mcp_servers.scriptorium.required=true",
+  ]
 
 proc buildCodexExecArgs*(request: CodexRunRequest, lastMessagePath: string): seq[string] =
   ## Build the codex exec argument list in a deterministic order.
@@ -243,12 +245,13 @@ proc buildCodexExecArgs*(request: CodexRunRequest, lastMessagePath: string): seq
   if lastMessagePath.len == 0:
     raise newException(ValueError, "lastMessagePath is required")
 
-  let mcpServersConfig = buildMcpServersConfig(request)
+  let mcpServersArgs = buildMcpServersArgs(request)
   result = @[
     "-c",
     DefaultCodexDeveloperInstructions,
-    "-c",
-    mcpServersConfig,
+  ]
+  result.add(mcpServersArgs)
+  result.add(@[
     "exec",
     "--json",
     "--output-last-message",
@@ -258,7 +261,7 @@ proc buildCodexExecArgs*(request: CodexRunRequest, lastMessagePath: string): seq
     "--model",
     request.model,
     "--dangerously-bypass-approvals-and-sandbox",
-  ]
+  ])
 
   let reasoningEffort = resolveReasoningEffort(request)
   if reasoningEffort.len > 0:
@@ -539,6 +542,9 @@ proc runCodexAttempt(request: CodexRunRequest, prompt: string, attemptValue: int
   result.lastMessageFile = lastMessagePath
   result.stdout = ""
   result.lastMessage = ""
+
+  let fullCmd = result.command.join(" ")
+  echo "DEBUG codex command: " & fullCmd
 
   let logFile = open(logFilePath, fmWrite)
   defer:
