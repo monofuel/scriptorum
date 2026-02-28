@@ -31,6 +31,13 @@ Rules:
 - Do not put mocked tests in integration test files. Do not call real services in unit test files.
 - Integration tests may be slow, flaky, or require credentials. That is expected and fine.
 
+## project best practices
+
+- stick to minimal dependencies.
+  - prefer dependencies from monofuel, treeform, and guzba.
+- stick to nim for programming.
+- organize commands with a Makefile to make projects easy to automate.
+
 ## Nim
 
 ## Nim best practices
