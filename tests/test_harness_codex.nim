@@ -66,6 +66,24 @@ suite "harness codex":
     let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
     check "model_reasoning_effort=\"high\"" in args
 
+  test "buildCodexMcpListArgs includes mcp config and mcp list --json":
+    let request = CodexRunRequest(
+      mcpEndpoint: "http://127.0.0.1:8097",
+    )
+
+    let args = buildCodexMcpListArgs(request)
+    check args[0] == "-c"
+    check "mcp_servers.scriptorium" in args[1]
+    check "mcp" in args
+    check "list" in args
+    check "--json" in args
+
+  test "buildCodexMcpListArgs returns only subcommand when no endpoint":
+    let request = CodexRunRequest()
+
+    let args = buildCodexMcpListArgs(request)
+    check args == @["mcp", "list", "--json"]
+
   test "buildCodexExecArgs includes mcp server when endpoint is configured":
     let request = CodexRunRequest(
       workingDir: "/tmp/worktree",
@@ -74,9 +92,8 @@ suite "harness codex":
     )
 
     let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
-    check "mcp_servers.scriptorium.url=\"http://127.0.0.1:8097/mcp\"" in args
-    check "mcp_servers.scriptorium.enabled=true" in args
-    check "mcp_servers.scriptorium.required=true" in args
+    let expectedMcpArg = "mcp_servers.scriptorium={url = \"http://127.0.0.1:8097/mcp\", enabled = true, required = true}"
+    check expectedMcpArg in args
 
   test "buildCodexExecArgs trims trailing slash from mcp endpoint":
     let request = CodexRunRequest(
@@ -86,9 +103,8 @@ suite "harness codex":
     )
 
     let args = buildCodexExecArgs(request, "/tmp/last-message.txt")
-    check "mcp_servers.scriptorium.url=\"http://127.0.0.1:8097/mcp\"" in args
-    check "mcp_servers.scriptorium.enabled=true" in args
-    check "mcp_servers.scriptorium.required=true" in args
+    let expectedMcpArg = "mcp_servers.scriptorium={url = \"http://127.0.0.1:8097/mcp\", enabled = true, required = true}"
+    check expectedMcpArg in args
 
   test "buildCodexExecArgs includes reasoning effort override when configured":
     let request = CodexRunRequest(

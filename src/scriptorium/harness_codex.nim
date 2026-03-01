@@ -217,7 +217,7 @@ proc readOutputChunk(fd: cint): tuple[data: string, eof: bool] =
     break
 
 proc buildMcpServersArgs(request: CodexRunRequest): seq[string] =
-  ## Build codex -c args for MCP server configuration using separate dot-notation keys.
+  ## Build codex -c args for MCP server configuration using table syntax.
   let cleanEndpoint = request.mcpEndpoint.strip()
   if cleanEndpoint.len == 0:
     return @[]
@@ -230,11 +230,14 @@ proc buildMcpServersArgs(request: CodexRunRequest): seq[string] =
     return @[]
 
   let mcpUrl = endpointBase & "/mcp"
+  let mcpString = "{" & &"url = \"{mcpUrl}\", enabled = true, required = true" & "}"
   result = @[
-    "-c", &"mcp_servers.scriptorium.url=\"{mcpUrl}\"",
-    "-c", "mcp_servers.scriptorium.enabled=true",
-    "-c", "mcp_servers.scriptorium.required=true",
+    "-c", "mcp_servers.scriptorium=" & mcpString,
   ]
+
+proc buildCodexMcpListArgs*(request: CodexRunRequest): seq[string] =
+  ## Build the codex argument list for `mcp list --json`.
+  result = buildMcpServersArgs(request) & @["mcp", "list", "--json"]
 
 proc buildCodexExecArgs*(request: CodexRunRequest, lastMessagePath: string): seq[string] =
   ## Build the codex exec argument list in a deterministic order.

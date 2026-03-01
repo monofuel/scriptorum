@@ -1,13 +1,13 @@
 ## Integration tests for live MCP submit_pr transport and real Codex tool calling.
 
 import
-  std/[httpclient, json, os, strformat, strutils, tempfiles, times, unittest],
+  std/[httpclient, json, os, osproc, strformat, strutils, tempfiles, times, unittest],
   mcport,
   scriptorium/[harness_codex, orchestrator]
 
 const
   LiveMcpBasePort = 22000
-  DefaultIntegrationModel = "gpt-5.1-codex-mini"
+  DefaultIntegrationModel = "gpt-5.3-codex"
   CodexAuthPathEnv = "CODEX_AUTH_FILE"
   RpcTimeoutMs = 30_000
   CodexHardTimeoutMs = 120_000
@@ -155,12 +155,13 @@ suite "integration mcp submit_pr live":
       worktreePath = tmpDir / "worktree"
       timestamp = now().utc().format("yyyyMMddHHmmss")
       nonce = &"it-live-02-{getCurrentProcessId()}-{timestamp}"
-      expectedMcpUrlArg = "mcp_servers.scriptorium.url=\"" & endpoint & "/mcp\""
+      expectedMcpArg = "mcp_servers.scriptorium={url = \"" & endpoint & "/mcp\", enabled = true, required = true}"
       prompt =
         "You are running an integration test. " &
         "You have a function called submit_pr in your tool list. " &
         "Use the submit_pr function exactly once with the argument summary=\"" & nonce & "\". " &
         "Do not execute any shell commands. Do not search the filesystem. " &
+        "if the function is missing, fail immediately." &
         "After the function call succeeds, reply with exactly DONE."
     createDir(worktreePath)
 
@@ -181,11 +182,64 @@ suite "integration mcp submit_pr live":
       "codex failed to complete live MCP submit_pr integration.\n" &
       "Command: " & runResult.command.join(" ") & "\n" &
       "Stdout:\n" & runResult.stdout
-    check expectedMcpUrlArg in runResult.command
-    check runResult.stdout.contains("mcp__scriptorium__submit_pr")
+    check expectedMcpArg in runResult.command
+    check runResult.stdout.contains("\"type\":\"mcp_tool_call\"")
+    check runResult.stdout.contains("\"tool\":\"submit_pr\"")
     let consumedSummary = consumeSubmitPrSummary()
     doAssert consumedSummary == nonce,
       "expected live submit_pr summary was not captured.\n" &
       "Expected: " & nonce & "\n" &
       "Actual: " & consumedSummary & "\n" &
       "Stdout:\n" & runResult.stdout
+
+  test "IT-LIVE-03 codex mcp list confirms server is enabled and required":
+    let codexPath = findExe("codex")
+    doAssert codexPath.len > 0, "codex binary is required for live integration tests"
+
+    let port = mcpPort(3)
+    let endpoint = mcpBaseUrl(port)
+
+    let httpServer = createOrchestratorServer()
+    var serverThread: Thread[ServerThreadArgs]
+    createThread(serverThread, runHttpServer, (httpServer, "127.0.0.1", port))
+    sleep(ServerStartupSleepMs)
+    liveServers.add(httpServer)
+
+    let request = CodexRunRequest(
+      mcpEndpoint: endpoint,
+    )
+    let args = buildCodexMcpListArgs(request)
+    let cmdParts = @[codexPath] & args
+    var quotedCommandParts: seq[string] = @[]
+    for part in cmdParts:
+      quotedCommandParts.add(quoteShell(part))
+    let fullCommand = quotedCommandParts.join(" ")
+    let (output, exitCode) = execCmdEx(fullCommand)
+
+    doAssert exitCode == 0,
+      "codex mcp list --json failed.\n" &
+      "Command: " & fullCommand & "\n" &
+      "Output:\n" & output
+
+    let jsonOutput = parseJson(output.strip())
+    doAssert jsonOutput.kind == JArray,
+      "expected codex mcp list output to be a JSON array.\n" &
+      "Output:\n" & output
+
+    var foundScriptorium = false
+    var isEnabled = false
+    var isRequired = false
+    var hasRequired = false
+
+    for server in jsonOutput:
+      if server["name"].getStr() == "scriptorium":
+        foundScriptorium = true
+        isEnabled = server["enabled"].getBool()
+        if server.hasKey("required"):
+          hasRequired = true
+          isRequired = server["required"].getBool()
+
+    check foundScriptorium
+    check isEnabled
+    if hasRequired:
+      check isRequired
